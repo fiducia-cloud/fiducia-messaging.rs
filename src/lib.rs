@@ -103,3 +103,13 @@ pub use inbox::{Inbox as PgInbox, InboxDecision, InboxError};
 /// Behind `postgres`. The pure, transport-agnostic alternative is [`Relay`].
 #[cfg(feature = "postgres")]
 pub use db::OutboxPublisher;
+
+// RECONCILE: codex's original service types are preserved verbatim behind
+// `compat-service` under Compat* names so they don't clash with the integrated
+// `OutboxPublisher` (db) / `MessageEnvelope`. The compat envelope is reachable at
+// `compat_envelope::Envelope`; these are its transaction-scoped outbox + drainer.
+#[cfg(feature = "compat-service")]
+pub use transactional::{
+    Outbox as CompatOutbox, OutboxError as CompatOutboxError,
+    OutboxPublisher as CompatOutboxPublisher,
+};
