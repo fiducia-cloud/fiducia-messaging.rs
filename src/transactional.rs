@@ -27,6 +27,19 @@ fn is_publishable_subject(subject: &str) -> bool {
         && subject.split('.').all(|token| !token.is_empty())
 }
 
+fn validate_compat_publish(subject: &str, payload_len: usize) -> Result<(), OutboxError> {
+    if !is_publishable_subject(subject) {
+        return Err(OutboxError::InvalidSubject);
+    }
+    if payload_len > crate::outbox::MAX_MESSAGE_BYTES {
+        return Err(OutboxError::PayloadTooLarge {
+            actual: payload_len,
+            limit: crate::outbox::MAX_MESSAGE_BYTES,
+        });
+    }
+    Ok(())
+}
+
 /// Transaction-scoped outbox facade retained from the original service.
 #[derive(Clone)]
 pub struct Outbox {
@@ -44,10 +57,12 @@ impl Outbox {
         subject: &str,
         envelope: &Envelope<T>,
     ) -> Result<(), OutboxError> {
-        if !is_publishable_subject(subject) {
-            return Err(OutboxError::InvalidSubject);
-        }
+        // Validate before and after encoding: reject an injected subject without
+        // doing serialization work, then enforce the same 1 MiB publish boundary
+        // as the integrated outbox on the actual encoded bytes.
+        validate_compat_publish(subject, 0)?;
         let body = envelope.encode()?;
+        validate_compat_publish(subject, body.len())?;
         sqlx::query(COMPAT_ENQUEUE_SQL)
             .bind(envelope.message_id)
             .bind(envelope.tenant_id)
@@ -82,6 +97,18 @@ impl OutboxPublisher {
             .await?;
         let mut published = 0;
         for (message_id, subject, body) in rows {
+            if let Err(error) = validate_compat_publish(&subject, body.len()) {
+                // Legacy rows may predate the enqueue guard. Never hand a
+                // wildcard/injected subject or oversize payload to NATS; retain
+                // the row with durable error/backoff metadata for operator
+                // inspection, then continue with the rest of the batch.
+                sqlx::query(COMPAT_RESCHEDULE_SQL)
+                    .bind(message_id)
+                    .bind(error.to_string())
+                    .execute(&mut *tx)
+                    .await?;
+                continue;
+            }
             match self.nats.publish(subject, body.into()).await {
                 Ok(()) => {
                     self.nats
@@ -121,8 +148,10 @@ impl OutboxPublisher {
 
 #[derive(Debug, thiserror::Error)]
 pub enum OutboxError {
-    #[error("subject must be non-empty")]
+    #[error("subject must contain non-empty dot tokens and no wildcards, whitespace, or control characters")]
     InvalidSubject,
+    #[error("message payload is {actual} bytes; limit is {limit}")]
+    PayloadTooLarge { actual: usize, limit: usize },
     #[error(transparent)]
     Envelope(#[from] crate::compat_envelope::EnvelopeError),
     #[error(transparent)]
@@ -154,6 +183,26 @@ mod tests {
         ] {
             assert!(!is_publishable_subject(bad), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn compat_publish_guard_enforces_the_shared_payload_limit() {
+        assert!(validate_compat_publish(
+            "fiducia.executions.completed.v1",
+            crate::outbox::MAX_MESSAGE_BYTES
+        )
+        .is_ok());
+        assert!(matches!(
+            validate_compat_publish(
+                "fiducia.executions.completed.v1",
+                crate::outbox::MAX_MESSAGE_BYTES + 1
+            ),
+            Err(OutboxError::PayloadTooLarge {
+                actual,
+                limit,
+            }) if actual == crate::outbox::MAX_MESSAGE_BYTES + 1
+                && limit == crate::outbox::MAX_MESSAGE_BYTES
+        ));
     }
 
     #[test]

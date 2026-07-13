@@ -151,7 +151,9 @@ wildcards (`fiducia.executions.*.v1`). Baking a work-item or tenant id into the
 subject explodes the subject space and defeats those subscriptions. The `Subject`
 builder validates tokens (lowercase `[a-z0-9-]`, no wildcards, no dots) and
 rejects any token that parses as a UUID — an identifier leaking into a routing
-class.
+class. Integrated enqueue and relay paths re-parse the complete subject and
+enforce a 1 MiB serialized-payload ceiling before NATS sees a message; malformed
+or oversize pre-existing rows are parked as failed instead of retried forever.
 
 ```rust
 use fiducia_messaging::Subject;
@@ -194,7 +196,11 @@ Its legacy byte-envelope queries use the dedicated
 `message_outbox_compat` table created by migration 0001, not the integrated
 `message_outbox` shape. An all-features schema-contract test checks every column
 used by those queries so compatibility builds fail visibly if migration and code
-drift again.
+drift again. The compatibility path preserves its broader historical subject
+namespace, but rejects wildcards, whitespace/control characters, empty dot
+tokens, and payloads above the same 1 MiB ceiling both when enqueuing and before
+publishing. A pre-existing invalid compatibility row is retained with backoff
+and `last_error` metadata for operator inspection; it is never sent to NATS.
 
 ### flags-2-env
 
