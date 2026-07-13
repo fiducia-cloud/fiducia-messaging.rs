@@ -1,0 +1,29 @@
+# flags-2-env flag schema for the fiducia-relay CLI: maps command-line flags to
+# the env vars the binary reads (src/main.rs). Consumed by
+# scripts/with-flags2env.sh and audited in CI (cli-flags.yml).
+[help]
+url = "https://github.com/fiducia-cloud/fiducia-messaging.rs"
+columns = ["options", "env", "type", "description"]
+
+[parse]
+allow_unknown = false
+
+# SECRET: carries Postgres credentials (postgres://user:pass@host/db). Never log
+# this value; keep it out of shell history and CI logs.
+[flags.database-url]
+env = "DATABASE_URL"
+aliases = ["database-url"]
+type = "string"
+help = "Postgres connection string (SECRET — carries DB credentials)."
+
+[flags.nats-url]
+env = "NATS_URL"
+aliases = ["nats-url"]
+type = "string"
+help = "NATS server URL (defaults to nats://localhost:4222)."
+
+[flags.relay-batch]
+env = "RELAY_BATCH"
+aliases = ["relay-batch"]
+type = "integer"
+help = "Outbox rows claimed per drain batch (defaults to 100)."
