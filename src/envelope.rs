@@ -44,6 +44,10 @@ pub struct MessageEnvelope<T> {
     pub message_id: Uuid,
     /// Stable routing/type name, e.g. `execution.completed`.
     pub message_type: String,
+    /// Producing service/component, e.g. `fiducia-node`. Folded in from codex's
+    /// envelope; optional here so pre-existing producers need not set it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// Payload schema version; bump on a breaking payload change.
     pub schema_version: u32,
     /// Ties every message in one logical flow together (the root message's id).
