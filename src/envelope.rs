@@ -137,6 +137,29 @@ impl<T> MessageEnvelope<T> {
         self
     }
 
+    /// Record the producing service/component (codex's `source`).
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    /// Validate the envelope framing. Folded from codex's `Envelope::validate`:
+    /// rejects an unknown [`envelope_version`](Self::envelope_version) and any
+    /// blank identity field (`message_type`, or a present-but-empty `source`).
+    pub fn validate(&self) -> Result<(), MessagingError> {
+        if self.envelope_version != ENVELOPE_VERSION {
+            return Err(MessagingError::UnsupportedEnvelopeVersion(
+                self.envelope_version,
+            ));
+        }
+        if self.message_type.trim().is_empty()
+            || self.source.as_deref().is_some_and(|s| s.trim().is_empty())
+        {
+            return Err(MessagingError::MissingIdentity);
+        }
+        Ok(())
+    }
+
     /// Attach the authority [`fencing_token`](Self::fencing_token).
     pub fn with_fencing_token(mut self, token: u64) -> Self {
         self.fencing_token = Some(token);
