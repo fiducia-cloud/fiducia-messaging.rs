@@ -49,11 +49,13 @@
 //! The default build needs no network and no external services. Optional:
 //! * `postgres` — a real sqlx-backed outbox/inbox repo ([`db`]).
 //! * `nats` — a real JetStream publisher ([`NatsPublisher`](publisher::NatsPublisher)).
+//! * `compat-service` — the original direct PostgreSQL/core-NATS service API.
 //!
 //! [`fiducia-node`]: https://github.com/fiducia-cloud/fiducia-node.rs
 
 #![forbid(unsafe_code)]
 
+pub mod compat_envelope;
 pub mod envelope;
 pub mod error;
 pub mod outbox;
@@ -62,13 +64,22 @@ pub mod subjects;
 
 #[cfg(feature = "postgres")]
 pub mod db;
+#[cfg(feature = "postgres")]
+pub mod inbox;
+#[cfg(feature = "compat-service")]
+pub mod transactional;
 
 // Key types, re-exported at the crate root.
+pub use compat_envelope::{Envelope, EnvelopeError, ENVELOPE_VERSION};
 pub use envelope::MessageEnvelope;
 pub use error::MessagingError;
 pub use outbox::{Inbox, InboxRecord, OutboxRecord, OutboxStatus, Relay, RelayOutcome};
 pub use publisher::{PublishedMessage, Publisher, RecordingPublisher};
 pub use subjects::{Subject, SubjectError};
 
+#[cfg(feature = "postgres")]
+pub use inbox::{Inbox as TransactionalInbox, InboxDecision, InboxError};
 #[cfg(feature = "nats")]
 pub use publisher::NatsPublisher;
+#[cfg(feature = "compat-service")]
+pub use transactional::{Outbox, OutboxError, OutboxPublisher};

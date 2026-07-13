@@ -137,6 +137,29 @@ cargo test --features postgres              # + DB-free schema checks
 cargo run --bin fiducia-relay --features postgres,nats
 ```
 
+## Compatibility service preserved from `fiducia-messaging`
+
+The original non-suffixed repository is merged into this history. Its versioned,
+tenant-aware envelope remains exported as `Envelope`, alongside the richer
+`MessageEnvelope`. Its transaction-scoped PostgreSQL `Outbox`,
+`TransactionalInbox`, and bounded core-NATS publisher are available with the
+`compat-service` feature:
+
+```sh
+cargo test --all-features
+cargo run --bin fiducia-messaging-compat --features compat-service
+```
+
+The compatibility worker uses `FOR UPDATE SKIP LOCKED`, durable retry metadata,
+exponential backoff, and a NATS flush before marking delivery. Set
+`DATABASE_URL` and `NATS_URL`; apply the bundled migration in each service
+database. Delivery remains at least once, with effectively-once side effects
+when consumers claim and mark inbox messages in the same transaction as their
+domain changes.
+
+The distroless image contains both `fiducia-relay` and
+`fiducia-messaging-compat`; the relay remains the default entrypoint.
+
 ## License
 
 MIT

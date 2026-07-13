@@ -264,13 +264,8 @@ mod tests {
 
     #[test]
     fn require_fencing_token_ok_and_err() {
-        let base = MessageEnvelope::new_at(
-            fixed_now(),
-            fixed_id(),
-            "runner.command",
-            (),
-            "idem-cmd",
-        );
+        let base =
+            MessageEnvelope::new_at(fixed_now(), fixed_id(), "runner.command", (), "idem-cmd");
 
         // Missing token -> typed error naming the message_type.
         let err = base.require_fencing_token().unwrap_err();
@@ -287,8 +282,8 @@ mod tests {
     #[test]
     fn expiry_is_deterministic() {
         let expires = fixed_now();
-        let env = MessageEnvelope::new_at(fixed_now(), fixed_id(), "t", (), "k")
-            .with_expiry(expires);
+        let env =
+            MessageEnvelope::new_at(fixed_now(), fixed_id(), "t", (), "k").with_expiry(expires);
 
         assert!(!env.is_expired(expires - chrono::Duration::seconds(1)));
         assert!(env.is_expired(expires)); // at the boundary

@@ -16,26 +16,30 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
-thiserror = "1"
+thiserror = "2"
 async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # The async `Publisher` trait's runtime + the relay binary's `#[tokio::main]`,
 # and the `#[tokio::test]` harness. No live services are touched by the tests.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["full"] }
 
 # Optional: a real Postgres-backed outbox/inbox repository (the `postgres`
 # feature). Runtime-checked queries only, so no DATABASE_URL is needed at build.
 sqlx = { version = "0.8", default-features = false, features = [
-    "runtime-tokio",
+    "runtime-tokio-rustls",
     "postgres",
     "uuid",
     "chrono",
     "json",
+    "migrate",
+    "macros",
 ], optional = true }
 
 # Optional: a real NATS JetStream publisher (the `nats` feature). The default
 # build must NOT pull this in — the crate builds and tests with no network.
-async-nats = { version = "0.38", optional = true }
+async-nats = { version = "0.42", optional = true }
 
 [features]
 default = []
@@ -43,11 +47,21 @@ default = []
 postgres = ["dep:sqlx"]
 # Real JetStream `Publisher` (`NatsPublisher`).
 nats = ["dep:async-nats"]
+# Original non-suffixed service: direct PostgreSQL outbox plus core NATS publish.
+compat-service = ["postgres", "nats"]
 
 [[bin]]
 name = "fiducia-relay"
 path = "src/main.rs"
 
+[[bin]]
+name = "fiducia-messaging-compat"
+path = "src/bin/fiducia-messaging-compat.rs"
+required-features = ["compat-service"]
+
 [lib]
 name = "fiducia_messaging"
 path = "src/lib.rs"
+
+[dev-dependencies]
+serde_json = "1"

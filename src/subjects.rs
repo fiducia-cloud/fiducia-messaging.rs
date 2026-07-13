@@ -50,7 +50,9 @@ pub enum SubjectError {
     Empty,
     /// A token contained something other than lowercase alphanumerics or `-`,
     /// or began/ended with `-`.
-    #[error("subject token {0:?} must be lowercase alphanumeric or hyphen (no leading/trailing '-')")]
+    #[error(
+        "subject token {0:?} must be lowercase alphanumeric or hyphen (no leading/trailing '-')"
+    )]
     InvalidChar(String),
     /// A token parses as a UUID — an identifier leaking into the routing class.
     #[error("subject token {0:?} looks like an identifier; identifiers belong in the envelope, not the subject")]
@@ -179,11 +181,15 @@ mod tests {
     #[test]
     fn constants_match_the_builder() {
         assert_eq!(
-            Subject::new("work-items", "created", 1).unwrap().as_string(),
+            Subject::new("work-items", "created", 1)
+                .unwrap()
+                .as_string(),
             WORK_ITEMS_CREATED
         );
         assert_eq!(
-            Subject::new("executions", "progress", 1).unwrap().as_string(),
+            Subject::new("executions", "progress", 1)
+                .unwrap()
+                .as_string(),
             EXECUTIONS_PROGRESS
         );
         assert_eq!(

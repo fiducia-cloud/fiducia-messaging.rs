@@ -371,8 +371,8 @@ mod tests {
             serde_json::json!({ "ok": true }),
             "idem-key-7",
         );
-        let row = OutboxRecord::from_envelope(id(100), "fiducia.executions.completed.v1", &env)
-            .unwrap();
+        let row =
+            OutboxRecord::from_envelope(id(100), "fiducia.executions.completed.v1", &env).unwrap();
         assert_eq!(row.dedup_id, "idem-key-7");
         assert_eq!(row.status, OutboxStatus::Pending);
         assert_eq!(row.attempts, 0);
