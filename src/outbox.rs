@@ -23,6 +23,32 @@ use uuid::Uuid;
 use crate::envelope::MessageEnvelope;
 use crate::error::MessagingError;
 use crate::publisher::Publisher;
+use crate::subjects::Subject;
+
+/// Maximum serialized message size the outbox will stage or the relay will
+/// publish, in bytes. Matches the NATS server default `max_payload` (1 MiB) so
+/// an oversize message is rejected at the boundary with a typed error instead
+/// of entering the outbox and failing every publish attempt. Deployments with a
+/// smaller server `max_payload` still get the broker's own rejection as the
+/// backstop.
+pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
+
+/// Validate that `subject` is a canonical `fiducia.<group>.<event>.v<version>`
+/// routing class and `payload_len` fits [`MAX_MESSAGE_BYTES`]. Shared by the
+/// enqueue path (`db::enqueue_outbox*`) and the drain paths ([`Relay::drain`],
+/// `db::OutboxPublisher`), so a subject assembled from an untrusted string
+/// (wildcards, injected `.` tokens, identifiers) or an oversize payload can
+/// neither enter the outbox nor reach NATS from pre-existing rows.
+pub fn validate_for_publish(subject: &str, payload_len: usize) -> Result<(), MessagingError> {
+    Subject::parse(subject)?;
+    if payload_len > MAX_MESSAGE_BYTES {
+        return Err(MessagingError::PayloadTooLarge {
+            actual: payload_len,
+            limit: MAX_MESSAGE_BYTES,
+        });
+    }
+    Ok(())
+}
 
 /// Lifecycle of an outbox row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,8 +237,13 @@ impl<'a> Relay<'a> {
     }
 
     /// Publish every record in `batch`, collecting successes and failures. Never
-    /// panics: a serialize or transport failure on one row is recorded and the
-    /// drain continues.
+    /// panics: a serialize, validation, or transport failure on one row is
+    /// recorded and the drain continues.
+    ///
+    /// Each row is re-validated with [`validate_for_publish`] before it touches
+    /// the publisher, so a malformed subject (wildcard/injection) or an oversize
+    /// payload that reached the outbox by another path is failed here rather
+    /// than handed to NATS.
     pub async fn drain(&self, batch: &[OutboxRecord]) -> RelayOutcome {
         let mut outcome = RelayOutcome::default();
         for rec in batch {
@@ -223,6 +254,10 @@ impl<'a> Relay<'a> {
                     continue;
                 }
             };
+            if let Err(e) = validate_for_publish(&rec.subject, bytes.len()) {
+                outcome.failed.push((rec.id, e.to_string()));
+                continue;
+            }
             match self
                 .publisher
                 .publish(&rec.subject, &rec.dedup_id, &bytes)
@@ -377,6 +412,71 @@ mod tests {
         assert_eq!(outcome.published, vec![id(1), id(2)]);
         // ...but only one message actually reached the bus.
         assert_eq!(publisher.len(), 1);
+    }
+
+    #[test]
+    fn validate_for_publish_enforces_taxonomy_and_size() {
+        assert!(validate_for_publish("fiducia.executions.completed.v1", 10).is_ok());
+        assert!(validate_for_publish("fiducia.executions.completed.v1", MAX_MESSAGE_BYTES).is_ok());
+        // NATS wildcards and malformed shapes are rejected.
+        assert!(matches!(
+            validate_for_publish("fiducia.executions.*.v1", 10),
+            Err(MessagingError::InvalidSubject(_))
+        ));
+        assert!(matches!(
+            validate_for_publish("fiducia.executions.>", 10),
+            Err(MessagingError::InvalidSubject(_))
+        ));
+        // A tenant-controlled token cannot forge extra subject levels.
+        assert!(matches!(
+            validate_for_publish("fiducia.executions.completed.v1.tenant-b", 10),
+            Err(MessagingError::InvalidSubject(_))
+        ));
+        assert!(matches!(
+            validate_for_publish("fiducia.executions.completed.v1", MAX_MESSAGE_BYTES + 1),
+            Err(MessagingError::PayloadTooLarge {
+                actual,
+                limit: MAX_MESSAGE_BYTES,
+            }) if actual == MAX_MESSAGE_BYTES + 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn relay_fails_injected_subjects_without_publishing() {
+        let publisher = RecordingPublisher::new();
+        let relay = Relay::new(&publisher);
+        let mut wildcard = rec(1, "d-1");
+        wildcard.subject = "fiducia.executions.>".into();
+        let mut forged_level = rec(2, "d-2");
+        forged_level.subject = "fiducia.executions.completed.v1.evil".into();
+        let batch = vec![wildcard, forged_level, rec(3, "d-3")];
+
+        let outcome = relay.drain(&batch).await;
+
+        assert_eq!(outcome.published, vec![id(3)]);
+        assert_eq!(outcome.failed_count(), 2);
+        assert!(outcome.failed[0].1.contains("invalid publish subject"));
+        // Only the canonical routing class reached the bus.
+        assert_eq!(publisher.len(), 1);
+        assert_eq!(
+            publisher.published()[0].subject,
+            "fiducia.executions.completed.v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_fails_oversize_payloads_without_publishing() {
+        let publisher = RecordingPublisher::new();
+        let relay = Relay::new(&publisher);
+        let mut oversize = rec(1, "d-1");
+        oversize.payload = serde_json::json!({ "blob": "x".repeat(MAX_MESSAGE_BYTES) });
+
+        let outcome = relay.drain(&[oversize]).await;
+
+        assert!(outcome.published.is_empty());
+        assert_eq!(outcome.failed_count(), 1);
+        assert!(outcome.failed[0].1.contains("limit is"));
+        assert!(publisher.is_empty());
     }
 
     #[tokio::test]

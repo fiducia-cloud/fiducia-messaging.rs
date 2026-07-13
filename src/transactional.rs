@@ -13,6 +13,20 @@ const COMPAT_MARK_PUBLISHED_SQL: &str =
 const COMPAT_RESCHEDULE_SQL: &str =
     "UPDATE message_outbox_compat SET attempts=attempts+1,last_error=$2,available_at=now()+least(interval '5 minutes', interval '1 second' * power(2, least(attempts, 8))) WHERE message_id=$1";
 
+/// Injection guard for compat subjects. The compat service historically
+/// accepted any non-empty subject, so this stays deliberately looser than the
+/// canonical taxonomy (`subjects::Subject::parse`) — but a subject assembled
+/// from an untrusted string must not smuggle NATS wildcards (`*`, `>`),
+/// whitespace/control characters, or empty tokens (leading/trailing/double
+/// dots) into the publish path.
+fn is_publishable_subject(subject: &str) -> bool {
+    !subject.trim().is_empty()
+        && !subject
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '*' || c == '>')
+        && subject.split('.').all(|token| !token.is_empty())
+}
+
 /// Transaction-scoped outbox facade retained from the original service.
 #[derive(Clone)]
 pub struct Outbox {
@@ -30,7 +44,7 @@ impl Outbox {
         subject: &str,
         envelope: &Envelope<T>,
     ) -> Result<(), OutboxError> {
-        if subject.trim().is_empty() {
+        if !is_publishable_subject(subject) {
             return Err(OutboxError::InvalidSubject);
         }
         let body = envelope.encode()?;
@@ -120,6 +134,27 @@ pub enum OutboxError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compat_subject_guard_blocks_injection() {
+        // Historic freedom is preserved: any dot-token subject without
+        // wildcards/whitespace is accepted, canonical or not.
+        assert!(is_publishable_subject("fiducia.executions.completed.v1"));
+        assert!(is_publishable_subject("legacy-subject"));
+        for bad in [
+            "",
+            "   ",
+            "fiducia..completed",
+            ".fiducia.executions",
+            "fiducia.executions.",
+            "fiducia.>",
+            "fiducia.*.v1",
+            "fiducia.exec utions",
+            "fiducia.exec\u{7}utions",
+        ] {
+            assert!(!is_publishable_subject(bad), "accepted {bad:?}");
+        }
+    }
 
     #[test]
     fn compatibility_queries_match_the_canonical_migration() {

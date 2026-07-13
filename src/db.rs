@@ -14,8 +14,16 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::error::MessagingError;
-use crate::outbox::{OutboxRecord, OutboxStatus};
+use crate::outbox::{validate_for_publish, OutboxRecord, OutboxStatus};
 use crate::publisher::Publisher;
+
+/// Validate a record before it is staged: canonical subject (no wildcard /
+/// injected tokens) and serialized payload within
+/// [`MAX_MESSAGE_BYTES`](crate::outbox::MAX_MESSAGE_BYTES).
+fn validate_outbox_record(rec: &OutboxRecord) -> Result<(), MessagingError> {
+    let payload_len = serde_json::to_vec(&rec.payload)?.len();
+    validate_for_publish(&rec.subject, payload_len)
+}
 
 /// The messaging schema DDL, embedded from the first migration. Idempotent, so
 /// [`apply_schema`] can run it directly and `sqlx::migrate!` can run the same
@@ -41,7 +49,9 @@ pub async fn apply_schema(pool: &PgPool) -> Result<(), MessagingError> {
 
 /// Insert a staged outbox row using a pool connection. Convenience for callers
 /// with no open transaction; a repeated tenant-scoped business key is ignored
-/// (`ON CONFLICT`), so enqueue is itself idempotent.
+/// (`ON CONFLICT`), so enqueue is itself idempotent. The subject must be a
+/// canonical routing class and the payload within size limits (see
+/// [`validate_for_publish`]).
 ///
 // RECONCILE: this pool-based enqueue runs in its OWN connection, so it is *not*
 // atomic with the caller's domain change — which defeats the whole point of a
@@ -50,6 +60,7 @@ pub async fn apply_schema(pool: &PgPool) -> Result<(), MessagingError> {
 // correct entry point for the outbox pattern. This pool variant is kept for
 // backwards compatibility and one-off/manual enqueues.
 pub async fn enqueue_outbox(pool: &PgPool, rec: &OutboxRecord) -> Result<(), MessagingError> {
+    validate_outbox_record(rec)?;
     sqlx::query(OUTBOX_INSERT_SQL)
         .bind(rec.id)
         .bind(&rec.subject)
@@ -75,10 +86,10 @@ pub async fn enqueue_outbox_tx(
     tx: &mut Transaction<'_, Postgres>,
     rec: &OutboxRecord,
 ) -> Result<(), MessagingError> {
-    // Preserve codex's non-empty-subject guard.
-    if rec.subject.trim().is_empty() {
-        return Err(MessagingError::database("outbox subject must be non-empty"));
-    }
+    // Strengthens codex's non-empty-subject guard: the subject must be a
+    // canonical routing class (no wildcards / injected tokens) and the payload
+    // within MAX_MESSAGE_BYTES, so poison rows never enter the outbox.
+    validate_outbox_record(rec)?;
     sqlx::query(OUTBOX_INSERT_SQL)
         .bind(rec.id)
         .bind(&rec.subject)
@@ -384,6 +395,14 @@ impl<'a> OutboxPublisher<'a> {
                     break;
                 }
             };
+            if let Err(error) = validate_for_publish(&record.subject, bytes.len()) {
+                // Deterministic row defect (malformed/injected subject or an
+                // oversize payload, e.g. staged before this guard existed):
+                // retrying cannot succeed, so park the row for operator
+                // attention instead of burning attempts and blocking the batch.
+                mark_failed(self.pool, record.id, claim_owner, &error.to_string()).await?;
+                continue;
+            }
             match self
                 .publisher
                 .publish(&record.subject, &record.dedup_id, &bytes)

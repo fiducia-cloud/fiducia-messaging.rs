@@ -38,6 +38,24 @@ pub enum MessagingError {
     #[error("message_type and source must be non-empty")]
     MissingIdentity,
 
+    /// A message was staged or drained with a subject that is not a canonical
+    /// `fiducia.<group>.<event>.v<version>` routing class. Wildcards, extra
+    /// tokens, or otherwise injected characters (e.g. from a tenant-controlled
+    /// string interpolated into a subject) are rejected before reaching NATS.
+    #[error("invalid publish subject: {0}")]
+    InvalidSubject(#[from] crate::subjects::SubjectError),
+
+    /// A serialized message exceeds [`crate::outbox::MAX_MESSAGE_BYTES`]. NATS
+    /// enforces a server-side `max_payload` (default 1 MiB); rejecting oversize
+    /// messages at the outbox boundary keeps them from poisoning the relay.
+    #[error("message payload is {actual} bytes; limit is {limit}")]
+    PayloadTooLarge {
+        /// Serialized payload size in bytes.
+        actual: usize,
+        /// The enforced limit ([`crate::outbox::MAX_MESSAGE_BYTES`]).
+        limit: usize,
+    },
+
     /// Payload (de)serialization failed.
     #[error("serialize/deserialize failed: {0}")]
     Serialize(#[from] serde_json::Error),
