@@ -2,19 +2,25 @@
 //!
 //! Runtime-checked queries only (`sqlx::query`, not the `query!` macros), so the
 //! crate builds with no `DATABASE_URL` and no live database. The schema lives in
-//! `sql/messaging.sql` and is embedded via [`SCHEMA_SQL`]; apply it on boot with
-//! [`apply_schema`]. These functions are the durable counterparts to the pure
-//! logic in [`crate::outbox`].
+//! `migrations/0001_fiducia_messaging.sql` and is embedded via [`SCHEMA_SQL`];
+//! apply it on boot with [`apply_schema`] (or run the whole `migrations/` dir
+//! with `sqlx::migrate!`). These functions are the durable counterparts to the
+//! pure logic in [`crate::outbox`].
+
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::error::MessagingError;
 use crate::outbox::{OutboxRecord, OutboxStatus};
+use crate::publisher::Publisher;
 
-/// The messaging schema DDL, embedded from `sql/messaging.sql`.
-pub const SCHEMA_SQL: &str = include_str!("../sql/messaging.sql");
+/// The messaging schema DDL, embedded from the first migration. Idempotent, so
+/// [`apply_schema`] can run it directly and `sqlx::migrate!` can run the same
+/// file as a tracked migration.
+pub const SCHEMA_SQL: &str = include_str!("../migrations/0001_fiducia_messaging.sql");
 
 /// Apply the messaging schema. Idempotent (`CREATE TABLE IF NOT EXISTS`), so it
 /// is safe to call on every process start.
@@ -26,28 +32,62 @@ pub async fn apply_schema(pool: &PgPool) -> Result<(), MessagingError> {
     Ok(())
 }
 
-/// Insert a staged outbox row. Call inside the *same* transaction as the domain
-/// change it accompanies. A repeated `dedup_id` is ignored (`ON CONFLICT`), so
-/// enqueue is itself idempotent.
+/// Insert a staged outbox row using a pool connection. Convenience for callers
+/// with no open transaction; a repeated `dedup_id` is ignored (`ON CONFLICT`),
+/// so enqueue is itself idempotent.
+///
+// RECONCILE: this pool-based enqueue runs in its OWN connection, so it is *not*
+// atomic with the caller's domain change — which defeats the whole point of a
+// transactional outbox. Codex's `Outbox::enqueue` took a `&mut Transaction`;
+// that behaviour is preserved as [`enqueue_outbox_tx`] below, which is the
+// correct entry point for the outbox pattern. This pool variant is kept for
+// backwards compatibility and one-off/manual enqueues.
 pub async fn enqueue_outbox(pool: &PgPool, rec: &OutboxRecord) -> Result<(), MessagingError> {
-    sqlx::query(
-        "INSERT INTO message_outbox
-            (id, subject, dedup_id, payload, status, attempts, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (dedup_id) DO NOTHING",
-    )
-    .bind(rec.id)
-    .bind(&rec.subject)
-    .bind(&rec.dedup_id)
-    .bind(&rec.payload)
-    .bind(rec.status.as_str())
-    .bind(rec.attempts as i32)
-    .bind(rec.created_at)
-    .execute(pool)
-    .await
-    .map_err(MessagingError::database)?;
+    sqlx::query(OUTBOX_INSERT_SQL)
+        .bind(rec.id)
+        .bind(&rec.subject)
+        .bind(&rec.dedup_id)
+        .bind(&rec.payload)
+        .bind(rec.status.as_str())
+        .bind(rec.attempts as i32)
+        .bind(rec.created_at)
+        .execute(pool)
+        .await
+        .map_err(MessagingError::database)?;
     Ok(())
 }
+
+/// Insert a staged outbox row **inside the caller's transaction** — the correct
+/// transactional-outbox usage (folded from codex's `Outbox::enqueue`): the row
+/// commits atomically with the domain change it accompanies, so a message is
+/// never lost nor sent for a rolled-back change. A repeated `dedup_id` is
+/// ignored (`ON CONFLICT`), keeping enqueue idempotent.
+pub async fn enqueue_outbox_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    rec: &OutboxRecord,
+) -> Result<(), MessagingError> {
+    // Preserve codex's non-empty-subject guard.
+    if rec.subject.trim().is_empty() {
+        return Err(MessagingError::database("outbox subject must be non-empty"));
+    }
+    sqlx::query(OUTBOX_INSERT_SQL)
+        .bind(rec.id)
+        .bind(&rec.subject)
+        .bind(&rec.dedup_id)
+        .bind(&rec.payload)
+        .bind(rec.status.as_str())
+        .bind(rec.attempts as i32)
+        .bind(rec.created_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(MessagingError::database)?;
+    Ok(())
+}
+
+const OUTBOX_INSERT_SQL: &str = "INSERT INTO message_outbox
+        (id, subject, dedup_id, payload, status, attempts, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (dedup_id) DO NOTHING";
 
 /// Claim up to `limit` pending rows (oldest first), bumping their attempt count.
 ///
