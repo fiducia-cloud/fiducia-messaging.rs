@@ -13,10 +13,21 @@
 //!     *effectively-once* external effects over an at-least-once transport.
 
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::MessagingError;
+
+/// The current envelope *wire-format* version. Distinct from
+/// [`MessageEnvelope::schema_version`] (which versions the typed `payload`):
+/// this versions the envelope framing itself. Folded in from codex's
+/// `ENVELOPE_VERSION`; [`MessageEnvelope::validate`] rejects any other value.
+pub const ENVELOPE_VERSION: u16 = 1;
+
+fn default_envelope_version() -> u16 {
+    ENVELOPE_VERSION
+}
 
 /// A typed message plus the metadata every message on the bus carries.
 ///
@@ -25,6 +36,10 @@ use crate::error::MessagingError;
 /// `now` and the `message_id`), then chain the `with_*` builders.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MessageEnvelope<T> {
+    /// Envelope wire-format version (see [`ENVELOPE_VERSION`]). Defaults on
+    /// deserialize so envelopes written before this field decode cleanly.
+    #[serde(default = "default_envelope_version")]
+    pub envelope_version: u16,
     /// Unique id of *this* message. Doubles as the JetStream dedup id.
     pub message_id: Uuid,
     /// Stable routing/type name, e.g. `execution.completed`.
