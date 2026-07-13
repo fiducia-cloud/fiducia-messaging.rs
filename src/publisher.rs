@@ -18,8 +18,9 @@ use crate::error::MessagingError;
 ///
 /// `dedup_id` is the JetStream `Nats-Msg-Id`: two publishes with the same
 /// `dedup_id` within the stream's dedup window collapse to one stored message.
-/// Callers pass the outbox row's `dedup_id` (the envelope's `idempotency_key`),
-/// so re-publishing an already-sent row is a server-side no-op.
+/// Callers pass the outbox row's `dedup_id`, a fixed-size digest of the
+/// envelope's `(tenant_id, idempotency_key)`, so retries collapse without two
+/// tenants sharing one raw business-key namespace.
 #[async_trait]
 pub trait Publisher: Send + Sync {
     /// Publish `payload` to `subject`, tagged with `dedup_id` for dedup.

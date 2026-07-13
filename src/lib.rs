@@ -14,8 +14,9 @@
 //! arrival. Two envelope fields carry this rule:
 //!
 //! * [`idempotency_key`](envelope::MessageEnvelope::idempotency_key) — a business
-//!   key for the effect the message drives, so a redelivery collapses to a single
-//!   external effect (at-most-once).
+//!   key for the effect the message drives, scoped by `tenant_id`, so a
+//!   redelivery collapses to a single external effect (at-most-once) without
+//!   cross-tenant collisions.
 //! * [`fencing_token`](envelope::MessageEnvelope::fencing_token) — a monotonic
 //!   token from fiducia-node's coordination (a lock/lease). A handler about to
 //!   mutate the outside world must present it via
@@ -31,9 +32,10 @@
 //! A Postgres commit and a NATS publish cannot be a single atomic operation. So
 //! a producer writes an [`OutboxRecord`](outbox::OutboxRecord) in the *same*
 //! transaction as its domain change, and a separate [`Relay`](outbox::Relay)
-//! publishes pending rows. If the relay crashes after publishing but before
-//! marking the row, it republishes — and JetStream's publish dedup (keyed on the
-//! row's `dedup_id`) drops the duplicate. Consumers use the
+//! publishes pending rows. The outbox derives its NATS dedup id from
+//! `(tenant_id, idempotency_key)`. If the relay crashes after publishing but
+//! before marking the row, it republishes — and JetStream's publish dedup
+//! (keyed on that tenant-scoped digest) drops the duplicate. Consumers use the
 //! [`Inbox`](outbox::Inbox) / `message_inbox` table to make their own effects
 //! at-most-once.
 //!
@@ -84,7 +86,9 @@ pub mod inbox;
 // Key types, re-exported at the crate root.
 pub use envelope::{MessageEnvelope, ENVELOPE_VERSION};
 pub use error::MessagingError;
-pub use outbox::{Inbox, InboxRecord, OutboxRecord, OutboxStatus, Relay, RelayOutcome};
+pub use outbox::{
+    tenant_scoped_dedup_id, Inbox, InboxRecord, OutboxRecord, OutboxStatus, Relay, RelayOutcome,
+};
 pub use publisher::{PublishedMessage, Publisher, RecordingPublisher};
 pub use subjects::{Subject, SubjectError};
 

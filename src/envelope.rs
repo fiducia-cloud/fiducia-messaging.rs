@@ -40,7 +40,8 @@ pub struct MessageEnvelope<T> {
     /// deserialize so envelopes written before this field decode cleanly.
     #[serde(default = "default_envelope_version")]
     pub envelope_version: u16,
-    /// Unique id of *this* message. Doubles as the JetStream dedup id.
+    /// Unique id of this envelope instance. JetStream dedup instead uses the
+    /// tenant-scoped digest of [`idempotency_key`](Self::idempotency_key).
     pub message_id: Uuid,
     /// Stable routing/type name, e.g. `execution.completed`.
     pub message_type: String,
