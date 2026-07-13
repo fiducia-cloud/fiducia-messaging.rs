@@ -60,6 +60,20 @@ pub mod outbox;
 pub mod publisher;
 pub mod subjects;
 
+/// The original, non-suffixed `Envelope<T>` from the codex-authored service,
+/// retained verbatim for **wire backward-compatibility** (its exact serialized
+/// shape). The integrated path uses [`MessageEnvelope`](envelope::MessageEnvelope);
+/// this exists so a consumer speaking the original format still decodes. Pure
+/// (serde/chrono/uuid), so it stays in the default offline build.
+pub mod compat_envelope;
+
+/// The codex-authored transaction-scoped `Outbox` + `OutboxPublisher` over the
+/// compat envelope, kept verbatim behind `compat-service` so the original direct
+/// PostgreSQL/NATS service API is preserved end-to-end. The integrated
+/// equivalents are [`Relay`](outbox::Relay) / [`OutboxPublisher`](db::OutboxPublisher).
+#[cfg(feature = "compat-service")]
+pub mod transactional;
+
 #[cfg(feature = "postgres")]
 pub mod db;
 

@@ -336,7 +336,9 @@ fn row_to_outbox(row: &sqlx::postgres::PgRow) -> Result<OutboxRecord, MessagingE
         subject: row.try_get("subject").map_err(MessagingError::database)?,
         dedup_id: row.try_get("dedup_id").map_err(MessagingError::database)?,
         payload: row.try_get("payload").map_err(MessagingError::database)?,
-        created_at: row.try_get("created_at").map_err(MessagingError::database)?,
+        created_at: row
+            .try_get("created_at")
+            .map_err(MessagingError::database)?,
         status: OutboxStatus::from_str(&status_str).unwrap_or(OutboxStatus::Pending),
         attempts: attempts.max(0) as u32,
     })
