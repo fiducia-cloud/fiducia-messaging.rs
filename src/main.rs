@@ -30,12 +30,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let js = async_nats::jetstream::new(client);
     let publisher = NatsPublisher::new(js);
 
-    // The merged DB-coupled drainer: SKIP LOCKED batches, exponential backoff,
-    // retry metadata, and JetStream-ack-before-mark (via `NatsPublisher`). The
-    // pure `outbox::Relay` remains available for callers that own the DB dance.
+    // The DB-coupled drainer: durable expiring claim leases, exponential
+    // backoff, retry metadata, and JetStream-ack-before-owner-conditioned-mark
+    // (via `NatsPublisher`). The pure `outbox::Relay` remains available for
+    // callers that own the DB dance.
     let outbox = OutboxPublisher::new(&pool, &publisher).with_batch_size(batch_size);
 
-    eprintln!("fiducia-relay: draining message_outbox -> {nats_url}");
+    eprintln!("fiducia-relay: draining message_outbox to configured NATS endpoint");
     outbox.run(Duration::from_millis(500)).await?;
     Ok(())
 }

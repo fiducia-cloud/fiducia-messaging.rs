@@ -2,8 +2,8 @@
 //!
 //! Runtime-checked queries only (`sqlx::query`, not the `query!` macros), so the
 //! crate builds with no `DATABASE_URL` and no live database. The schema lives in
-//! `migrations/0001_fiducia_messaging.sql` and is embedded via [`SCHEMA_SQL`];
-//! apply it on boot with [`apply_schema`] (or run the whole `migrations/` dir
+//! `migrations/` and is embedded via [`SCHEMA_SQL`] / [`HARDENING_SCHEMA_SQL`];
+//! apply it on boot with [`apply_schema`] (or run the whole migrations directory
 //! with `sqlx::migrate!`). These functions are the durable counterparts to the
 //! pure logic in [`crate::outbox`].
 
@@ -21,6 +21,9 @@ use crate::publisher::Publisher;
 /// [`apply_schema`] can run it directly and `sqlx::migrate!` can run the same
 /// file as a tracked migration.
 pub const SCHEMA_SQL: &str = include_str!("../migrations/0001_fiducia_messaging.sql");
+/// Forward migration adding tenant-scoped idempotency and durable claim leases.
+pub const HARDENING_SCHEMA_SQL: &str =
+    include_str!("../migrations/0002_tenant_dedup_and_claim_leases.sql");
 
 /// Apply the messaging schema. Idempotent (`CREATE TABLE IF NOT EXISTS`), so it
 /// is safe to call on every process start.
@@ -29,12 +32,16 @@ pub async fn apply_schema(pool: &PgPool) -> Result<(), MessagingError> {
         .execute(pool)
         .await
         .map_err(MessagingError::database)?;
+    sqlx::raw_sql(HARDENING_SCHEMA_SQL)
+        .execute(pool)
+        .await
+        .map_err(MessagingError::database)?;
     Ok(())
 }
 
 /// Insert a staged outbox row using a pool connection. Convenience for callers
-/// with no open transaction; a repeated `dedup_id` is ignored (`ON CONFLICT`),
-/// so enqueue is itself idempotent.
+/// with no open transaction; a repeated tenant-scoped business key is ignored
+/// (`ON CONFLICT`), so enqueue is itself idempotent.
 ///
 // RECONCILE: this pool-based enqueue runs in its OWN connection, so it is *not*
 // atomic with the caller's domain change — which defeats the whole point of a
@@ -46,6 +53,8 @@ pub async fn enqueue_outbox(pool: &PgPool, rec: &OutboxRecord) -> Result<(), Mes
     sqlx::query(OUTBOX_INSERT_SQL)
         .bind(rec.id)
         .bind(&rec.subject)
+        .bind(rec.tenant_id)
+        .bind(&rec.idempotency_key)
         .bind(&rec.dedup_id)
         .bind(&rec.payload)
         .bind(rec.status.as_str())
@@ -60,8 +69,8 @@ pub async fn enqueue_outbox(pool: &PgPool, rec: &OutboxRecord) -> Result<(), Mes
 /// Insert a staged outbox row **inside the caller's transaction** — the correct
 /// transactional-outbox usage (folded from codex's `Outbox::enqueue`): the row
 /// commits atomically with the domain change it accompanies, so a message is
-/// never lost nor sent for a rolled-back change. A repeated `dedup_id` is
-/// ignored (`ON CONFLICT`), keeping enqueue idempotent.
+/// never lost nor sent for a rolled-back change. A repeated tenant-scoped
+/// business key is ignored (`ON CONFLICT`), keeping enqueue idempotent.
 pub async fn enqueue_outbox_tx(
     tx: &mut Transaction<'_, Postgres>,
     rec: &OutboxRecord,
@@ -73,6 +82,8 @@ pub async fn enqueue_outbox_tx(
     sqlx::query(OUTBOX_INSERT_SQL)
         .bind(rec.id)
         .bind(&rec.subject)
+        .bind(rec.tenant_id)
+        .bind(&rec.idempotency_key)
         .bind(&rec.dedup_id)
         .bind(&rec.payload)
         .bind(rec.status.as_str())
@@ -85,62 +96,158 @@ pub async fn enqueue_outbox_tx(
 }
 
 const OUTBOX_INSERT_SQL: &str = "INSERT INTO message_outbox
-        (id, subject, dedup_id, payload, status, attempts, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     ON CONFLICT (dedup_id) DO NOTHING";
+        (id, subject, tenant_id, idempotency_key, dedup_id, payload, status, attempts, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT DO NOTHING";
 
-/// Claim up to `limit` pending rows (oldest first), bumping their attempt count.
+const CLAIM_PENDING_SQL: &str = "WITH candidates AS (
+        SELECT id
+          FROM message_outbox
+         WHERE status = 'pending'
+           AND available_at <= now()
+           AND (claim_expires_at IS NULL OR claim_expires_at <= now())
+         ORDER BY created_at
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED
+    )
+    UPDATE message_outbox AS outbox
+       SET attempts = outbox.attempts + 1,
+           claim_owner = $2,
+           claim_expires_at = now() + ($3 * interval '1 millisecond')
+      FROM candidates
+     WHERE outbox.id = candidates.id
+    RETURNING outbox.id, outbox.subject, outbox.tenant_id,
+              outbox.idempotency_key, outbox.dedup_id, outbox.payload,
+              outbox.status, outbox.attempts, outbox.created_at";
+
+/// Atomically lease up to `limit` due rows to `claim_owner` and commit that
+/// ownership before returning. Other workers skip an active claim; after
+/// `claim_ttl` it becomes reclaimable if this worker crashed.
 ///
-/// Uses `FOR UPDATE SKIP LOCKED` so several relay workers can drain the outbox
-/// concurrently without handing the same row to two of them.
+/// The returned records have already had their attempt count incremented.
 pub async fn claim_pending_outbox(
     pool: &PgPool,
+    claim_owner: Uuid,
+    claim_ttl: Duration,
     limit: i64,
 ) -> Result<Vec<OutboxRecord>, MessagingError> {
-    let rows = sqlx::query(
-        "UPDATE message_outbox
-            SET attempts = attempts + 1
-          WHERE id IN (
-              SELECT id FROM message_outbox
-               WHERE status = 'pending'
-                 AND available_at <= now()
-               ORDER BY created_at
-               LIMIT $1
-               FOR UPDATE SKIP LOCKED
-          )
-        RETURNING id, subject, dedup_id, payload, status, attempts, created_at",
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .map_err(MessagingError::database)?;
+    if limit <= 0 {
+        return Err(MessagingError::database(
+            "outbox claim limit must be positive",
+        ));
+    }
+    let claim_ttl_ms = i64::try_from(claim_ttl.as_millis())
+        .ok()
+        .filter(|millis| *millis > 0)
+        .ok_or_else(|| MessagingError::database("outbox claim TTL must be positive and finite"))?;
+    let rows = sqlx::query(CLAIM_PENDING_SQL)
+        .bind(limit)
+        .bind(claim_owner)
+        .bind(claim_ttl_ms)
+        .fetch_all(pool)
+        .await
+        .map_err(MessagingError::database)?;
 
-    rows.iter().map(row_to_outbox).collect()
+    let mut records = rows
+        .iter()
+        .map(row_to_outbox)
+        .collect::<Result<Vec<_>, _>>()?;
+    records.sort_by_key(|record| record.created_at);
+    Ok(records)
 }
 
-/// Mark a row published and stamp `published_at`.
+/// Mark a row published only if `claim_owner` still owns it. Returns `false`
+/// when the lease expired and another worker reclaimed the row.
 pub async fn mark_published(
     pool: &PgPool,
     id: Uuid,
+    claim_owner: Uuid,
     at: DateTime<Utc>,
-) -> Result<(), MessagingError> {
-    sqlx::query("UPDATE message_outbox SET status = 'published', published_at = $2 WHERE id = $1")
-        .bind(id)
-        .bind(at)
-        .execute(pool)
-        .await
-        .map_err(MessagingError::database)?;
-    Ok(())
+) -> Result<bool, MessagingError> {
+    let result = sqlx::query(
+        "UPDATE message_outbox
+            SET status = 'published', published_at = $3,
+                last_error = NULL, claim_owner = NULL, claim_expires_at = NULL
+          WHERE id = $1 AND claim_owner = $2",
+    )
+    .bind(id)
+    .bind(claim_owner)
+    .bind(at)
+    .execute(pool)
+    .await
+    .map_err(MessagingError::database)?;
+    Ok(result.rows_affected() == 1)
 }
 
-/// Mark a row failed (retries exhausted); leaves it for operator attention.
-pub async fn mark_failed(pool: &PgPool, id: Uuid) -> Result<(), MessagingError> {
-    sqlx::query("UPDATE message_outbox SET status = 'failed' WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await
-        .map_err(MessagingError::database)?;
-    Ok(())
+/// Mark an owned row failed (retries exhausted). Returns `false` if ownership
+/// has already moved to another relay.
+pub async fn mark_failed(
+    pool: &PgPool,
+    id: Uuid,
+    claim_owner: Uuid,
+    error: &str,
+) -> Result<bool, MessagingError> {
+    let result = sqlx::query(
+        "UPDATE message_outbox
+            SET status = 'failed', last_error = $3,
+                claim_owner = NULL, claim_expires_at = NULL
+          WHERE id = $1 AND claim_owner = $2",
+    )
+    .bind(id)
+    .bind(claim_owner)
+    .bind(error)
+    .execute(pool)
+    .await
+    .map_err(MessagingError::database)?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Release one owned claim after a transient publish failure, record the error,
+/// and defer the next attempt with exponential backoff. Returns `false` if the
+/// row was already reclaimed by another owner.
+pub async fn reschedule_publish(
+    pool: &PgPool,
+    id: Uuid,
+    claim_owner: Uuid,
+    error: &str,
+) -> Result<bool, MessagingError> {
+    let result = sqlx::query(
+        "UPDATE message_outbox
+            SET last_error = $3,
+                available_at = now()
+                    + least(interval '5 minutes',
+                            interval '1 second'
+                                * power(2, least(greatest(attempts - 1, 0), 8))),
+                claim_owner = NULL,
+                claim_expires_at = NULL
+          WHERE id = $1 AND claim_owner = $2 AND status = 'pending'",
+    )
+    .bind(id)
+    .bind(claim_owner)
+    .bind(error)
+    .execute(pool)
+    .await
+    .map_err(MessagingError::database)?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Release every still-pending row owned by a batch claim. Used when a relay
+/// stops a batch after the first broker failure so untouched rows are
+/// immediately available to other workers rather than waiting for lease expiry.
+pub async fn release_outbox_claims(
+    pool: &PgPool,
+    claim_owner: Uuid,
+) -> Result<u64, MessagingError> {
+    let result = sqlx::query(
+        "UPDATE message_outbox
+            SET claim_owner = NULL, claim_expires_at = NULL
+          WHERE status = 'pending' AND claim_owner = $1",
+    )
+    .bind(claim_owner)
+    .execute(pool)
+    .await
+    .map_err(MessagingError::database)?;
+    Ok(result.rows_affected())
 }
 
 /// Try to record an incoming message for consumer dedup. Returns `true` the
@@ -152,12 +259,26 @@ pub async fn inbox_try_insert(
     idempotency_key: &str,
     received_at: DateTime<Utc>,
 ) -> Result<bool, MessagingError> {
+    inbox_try_insert_scoped(pool, None, message_id, idempotency_key, received_at).await
+}
+
+/// Tenant-scoped form of [`inbox_try_insert`]. The same business key may be
+/// consumed independently in different tenants, while remaining unique inside
+/// each tenant (or inside the explicit global `None` namespace).
+pub async fn inbox_try_insert_scoped(
+    pool: &PgPool,
+    tenant_id: Option<Uuid>,
+    message_id: Uuid,
+    idempotency_key: &str,
+    received_at: DateTime<Utc>,
+) -> Result<bool, MessagingError> {
     let result = sqlx::query(
-        "INSERT INTO message_inbox (message_id, idempotency_key, received_at)
-         VALUES ($1, $2, $3)
+        "INSERT INTO message_inbox (message_id, tenant_id, idempotency_key, received_at)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT DO NOTHING",
     )
     .bind(message_id)
+    .bind(tenant_id)
     .bind(idempotency_key)
     .bind(received_at)
     .execute(pool)
@@ -181,10 +302,11 @@ pub async fn inbox_mark_processed(
     Ok(())
 }
 
-/// A DB-coupled outbox drainer: claims a bounded batch of *due* pending rows
-/// with `FOR UPDATE SKIP LOCKED`, publishes each through a [`Publisher`], and
-/// records the outcome with retry metadata + exponential backoff — all in one
-/// transaction.
+/// A DB-coupled outbox drainer. It atomically commits an expiring owner lease on
+/// a bounded batch, releases the database connection, publishes through a
+/// [`Publisher`], then conditionally records each outcome by owner. This avoids
+/// holding a database transaction open across network I/O while preventing two
+/// live relays from publishing the same pending row.
 ///
 // RECONCILE: this is the merge of the two publisher designs.
 //   * MINE — `outbox::Relay`: pure and transport-agnostic (batch in, outcome
@@ -204,6 +326,7 @@ pub struct OutboxPublisher<'a> {
     publisher: &'a dyn Publisher,
     batch_size: i64,
     max_attempts: i32,
+    claim_ttl: Duration,
 }
 
 impl<'a> OutboxPublisher<'a> {
@@ -215,6 +338,7 @@ impl<'a> OutboxPublisher<'a> {
             publisher,
             batch_size: 100,
             max_attempts: 8,
+            claim_ttl: Duration::from_secs(300),
         }
     }
 
@@ -231,87 +355,69 @@ impl<'a> OutboxPublisher<'a> {
         self
     }
 
+    /// Override the durable claim lease. It must cover the expected worst-case
+    /// time to publish a whole batch; expired claims are deliberately
+    /// reclaimable after a worker crash.
+    pub fn with_claim_ttl(mut self, claim_ttl: Duration) -> Self {
+        self.claim_ttl = claim_ttl;
+        self
+    }
+
     /// Claim and publish one batch. Returns how many rows were published.
     ///
     /// Preserves codex's semantics: on the first publish failure it records the
     /// error + backoff and stops the batch (avoids hammering a down broker),
-    /// committing the progress made so far.
+    /// releasing untouched claims immediately.
     pub async fn publish_batch(&self) -> Result<u64, MessagingError> {
-        let mut tx = self.pool.begin().await.map_err(MessagingError::database)?;
-
-        let rows: Vec<(Uuid, String, String, serde_json::Value, i32)> = sqlx::query_as(
-            "SELECT id, subject, dedup_id, payload, attempts
-               FROM message_outbox
-              WHERE status = 'pending'
-                AND available_at <= now()
-              ORDER BY created_at
-              FOR UPDATE SKIP LOCKED
-              LIMIT $1",
-        )
-        .bind(self.batch_size)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(MessagingError::database)?;
+        let claim_owner = Uuid::new_v4();
+        let rows =
+            claim_pending_outbox(self.pool, claim_owner, self.claim_ttl, self.batch_size).await?;
 
         let mut published: u64 = 0;
-        for (id, subject, dedup_id, payload, attempts) in rows {
-            let bytes = serde_json::to_vec(&payload)?;
-            match self.publisher.publish(&subject, &dedup_id, &bytes).await {
+        for record in rows {
+            let bytes = match serde_json::to_vec(&record.payload) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.record_failure(&record, claim_owner, &error.to_string())
+                        .await?;
+                    release_outbox_claims(self.pool, claim_owner).await?;
+                    break;
+                }
+            };
+            match self
+                .publisher
+                .publish(&record.subject, &record.dedup_id, &bytes)
+                .await
+            {
                 Ok(()) => {
-                    sqlx::query(
-                        "UPDATE message_outbox
-                            SET status = 'published',
-                                published_at = now(),
-                                attempts = attempts + 1,
-                                last_error = NULL
-                          WHERE id = $1",
-                    )
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(MessagingError::database)?;
-                    published += 1;
+                    if mark_published(self.pool, record.id, claim_owner, Utc::now()).await? {
+                        published += 1;
+                    }
                 }
                 Err(error) => {
-                    if attempts + 1 >= self.max_attempts {
-                        // Retries exhausted -> park as failed for an operator.
-                        sqlx::query(
-                            "UPDATE message_outbox
-                                SET status = 'failed',
-                                    attempts = attempts + 1,
-                                    last_error = $2
-                              WHERE id = $1",
-                        )
-                        .bind(id)
-                        .bind(error.to_string())
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(MessagingError::database)?;
-                    } else {
-                        // Exponential backoff, capped at 5 minutes (codex's SQL).
-                        sqlx::query(
-                            "UPDATE message_outbox
-                                SET attempts = attempts + 1,
-                                    last_error = $2,
-                                    available_at = now()
-                                        + least(interval '5 minutes',
-                                                interval '1 second'
-                                                    * power(2, least(attempts, 8)))
-                              WHERE id = $1",
-                        )
-                        .bind(id)
-                        .bind(error.to_string())
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(MessagingError::database)?;
-                    }
+                    self.record_failure(&record, claim_owner, &error.to_string())
+                        .await?;
+                    release_outbox_claims(self.pool, claim_owner).await?;
                     break;
                 }
             }
         }
-
-        tx.commit().await.map_err(MessagingError::database)?;
         Ok(published)
+    }
+
+    async fn record_failure(
+        &self,
+        record: &OutboxRecord,
+        claim_owner: Uuid,
+        error: &str,
+    ) -> Result<(), MessagingError> {
+        let attempts = i32::try_from(record.attempts).unwrap_or(i32::MAX);
+        if attempts >= self.max_attempts {
+            mark_failed(self.pool, record.id, claim_owner, error).await?;
+        } else {
+            reschedule_publish(self.pool, record.id, claim_owner, error).await?;
+        }
+        Ok(())
     }
 
     /// Drain forever on a fixed interval. A batch failure is logged and the loop
@@ -334,6 +440,10 @@ fn row_to_outbox(row: &sqlx::postgres::PgRow) -> Result<OutboxRecord, MessagingE
     Ok(OutboxRecord {
         id: row.try_get("id").map_err(MessagingError::database)?,
         subject: row.try_get("subject").map_err(MessagingError::database)?,
+        tenant_id: row.try_get("tenant_id").map_err(MessagingError::database)?,
+        idempotency_key: row
+            .try_get("idempotency_key")
+            .map_err(MessagingError::database)?,
         dedup_id: row.try_get("dedup_id").map_err(MessagingError::database)?,
         payload: row.try_get("payload").map_err(MessagingError::database)?,
         created_at: row
@@ -360,5 +470,13 @@ mod tests {
         assert!(SCHEMA_SQL.contains("available_at"));
         assert!(SCHEMA_SQL.contains("last_error"));
         assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS message_inbox_consumer"));
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS message_outbox_compat"));
+        assert!(HARDENING_SCHEMA_SQL.contains("idempotency_key"));
+        assert!(HARDENING_SCHEMA_SQL.contains("claim_owner"));
+        assert!(HARDENING_SCHEMA_SQL.contains("claim_expires_at"));
+        assert!(HARDENING_SCHEMA_SQL.contains("message_outbox_tenant_idempotency_uq"));
+        assert!(HARDENING_SCHEMA_SQL.contains("message_inbox_tenant_idempotency_uq"));
+        assert!(CLAIM_PENDING_SQL.contains("claim_expires_at <= now()"));
+        assert!(CLAIM_PENDING_SQL.contains("claim_owner = $2"));
     }
 }

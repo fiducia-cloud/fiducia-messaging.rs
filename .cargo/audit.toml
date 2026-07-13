@@ -1,0 +1,7 @@
+# cargo-audit exception for an unreachable lockfile-only dependency.
+[advisories]
+ignore = [
+    # Present through sqlx-mysql metadata in Cargo.lock, but this crate enables
+    # PostgreSQL only. `cargo tree --all-features --target all -i rsa` has no path.
+    "RUSTSEC-2023-0071",
+]

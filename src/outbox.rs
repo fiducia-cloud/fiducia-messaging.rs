@@ -13,10 +13,11 @@
 //! Everything here is pure and deterministic — no clock, no id generation — so
 //! the caller threads in ids/timestamps and the tests assert exact values.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, fmt::Write};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::envelope::MessageEnvelope;
@@ -66,7 +67,11 @@ pub struct OutboxRecord {
     pub id: Uuid,
     /// Routing class the message goes to.
     pub subject: String,
-    /// JetStream dedup id (the envelope's `idempotency_key`).
+    /// Owning tenant. `None` is an explicitly global message namespace.
+    pub tenant_id: Option<Uuid>,
+    /// Raw business idempotency key, unique within `tenant_id`.
+    pub idempotency_key: String,
+    /// Fixed-size JetStream dedup id derived from tenant + business key.
     pub dedup_id: String,
     /// The serialized envelope.
     pub payload: serde_json::Value,
@@ -79,18 +84,36 @@ pub struct OutboxRecord {
 }
 
 impl OutboxRecord {
-    /// A fresh `Pending` row with zero attempts.
+    /// A fresh global-scope `Pending` row with zero attempts.
+    ///
+    /// Use [`pending_for_tenant`](Self::pending_for_tenant) for tenant-owned
+    /// work. `idempotency_key` is a business key, not a precomputed NATS id.
     pub fn pending(
         id: Uuid,
         subject: impl Into<String>,
-        dedup_id: impl Into<String>,
+        idempotency_key: impl Into<String>,
         payload: serde_json::Value,
         created_at: DateTime<Utc>,
     ) -> Self {
+        Self::pending_for_tenant(id, subject, None, idempotency_key, payload, created_at)
+    }
+
+    /// A fresh tenant-scoped `Pending` row with zero attempts.
+    pub fn pending_for_tenant(
+        id: Uuid,
+        subject: impl Into<String>,
+        tenant_id: Option<Uuid>,
+        idempotency_key: impl Into<String>,
+        payload: serde_json::Value,
+        created_at: DateTime<Utc>,
+    ) -> Self {
+        let idempotency_key = idempotency_key.into();
         OutboxRecord {
             id,
             subject: subject.into(),
-            dedup_id: dedup_id.into(),
+            tenant_id,
+            dedup_id: tenant_scoped_dedup_id(tenant_id, &idempotency_key),
+            idempotency_key,
             payload,
             created_at,
             status: OutboxStatus::Pending,
@@ -98,21 +121,49 @@ impl OutboxRecord {
         }
     }
 
-    /// Stage an envelope for publish, taking its `idempotency_key` as the
-    /// `dedup_id` and its `created_at` as the row timestamp.
+    /// Stage an envelope for publish. The raw business key is retained for the
+    /// tenant-scoped database uniqueness constraint; the NATS dedup id is a
+    /// fixed-size digest of `(tenant_id, idempotency_key)`.
     pub fn from_envelope<T: Serialize>(
         id: Uuid,
         subject: impl Into<String>,
         envelope: &MessageEnvelope<T>,
     ) -> Result<Self, MessagingError> {
-        Ok(Self::pending(
+        Ok(Self::pending_for_tenant(
             id,
             subject,
+            envelope.tenant_id,
             envelope.idempotency_key.clone(),
             envelope.to_json_value()?,
             envelope.created_at,
         ))
     }
+}
+
+/// Derive the JetStream `Nats-Msg-Id` from a tenant-scoped business key.
+///
+/// Length-prefixing prevents ambiguous concatenations, and SHA-256 keeps the
+/// header bounded while avoiding disclosure of the business key. The versioned
+/// domain separator makes any future encoding change explicit.
+pub fn tenant_scoped_dedup_id(tenant_id: Option<Uuid>, idempotency_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"fiducia-messaging:nats-dedup:v1\0");
+    match tenant_id {
+        Some(tenant_id) => {
+            hasher.update(b"tenant\0");
+            hasher.update(tenant_id.as_bytes());
+        }
+        None => hasher.update(b"global\0"),
+    }
+    hasher.update((idempotency_key.len() as u64).to_be_bytes());
+    hasher.update(idempotency_key.as_bytes());
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(3 + digest.len() * 2);
+    output.push_str("v1-");
+    for byte in digest {
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
 }
 
 /// The result of draining a batch: which rows published and which failed, so the
@@ -242,14 +293,26 @@ impl Inbox {
         Self::default()
     }
 
-    /// Returns `true` the first time a key is seen, `false` for a duplicate.
+    /// Returns `true` the first time a global business key is seen, `false` for
+    /// a duplicate.
     pub fn accept(&mut self, key: &str) -> bool {
-        self.seen.insert(key.to_string())
+        self.accept_for_tenant(None, key)
     }
 
-    /// Whether a key has already been accepted.
+    /// Tenant-scoped equivalent of [`accept`](Self::accept). The same business
+    /// key may be accepted independently by different tenants.
+    pub fn accept_for_tenant(&mut self, tenant_id: Option<Uuid>, key: &str) -> bool {
+        self.seen.insert(tenant_scoped_dedup_id(tenant_id, key))
+    }
+
+    /// Whether a global business key has already been accepted.
     pub fn contains(&self, key: &str) -> bool {
-        self.seen.contains(key)
+        self.seen.contains(&tenant_scoped_dedup_id(None, key))
+    }
+
+    /// Whether a tenant-scoped business key has already been accepted.
+    pub fn contains_for_tenant(&self, tenant_id: Option<Uuid>, key: &str) -> bool {
+        self.seen.contains(&tenant_scoped_dedup_id(tenant_id, key))
     }
 
     /// Number of distinct keys accepted.
@@ -363,20 +426,45 @@ mod tests {
     }
 
     #[test]
-    fn outbox_from_envelope_uses_idempotency_key() {
+    fn outbox_from_envelope_scopes_business_key_to_tenant() {
+        let tenant_a = id(70);
+        let tenant_b = id(71);
         let env = MessageEnvelope::new_at(
             at(0),
             id(7),
             "execution.completed",
             serde_json::json!({ "ok": true }),
             "idem-key-7",
-        );
+        )
+        .with_tenant(tenant_a);
         let row =
             OutboxRecord::from_envelope(id(100), "fiducia.executions.completed.v1", &env).unwrap();
-        assert_eq!(row.dedup_id, "idem-key-7");
+        assert_eq!(row.tenant_id, Some(tenant_a));
+        assert_eq!(row.idempotency_key, "idem-key-7");
+        assert_eq!(
+            row.dedup_id,
+            tenant_scoped_dedup_id(Some(tenant_a), "idem-key-7")
+        );
+        assert_ne!(
+            row.dedup_id,
+            tenant_scoped_dedup_id(Some(tenant_b), "idem-key-7")
+        );
+        assert_ne!(row.dedup_id, "idem-key-7");
+        assert_eq!(row.dedup_id.len(), 67);
         assert_eq!(row.status, OutboxStatus::Pending);
         assert_eq!(row.attempts, 0);
         assert_eq!(row.created_at, at(0));
+    }
+
+    #[test]
+    fn inbox_business_keys_are_tenant_scoped() {
+        let mut inbox = Inbox::new();
+        let tenant_a = id(80);
+        let tenant_b = id(81);
+        assert!(inbox.accept_for_tenant(Some(tenant_a), "sync-42"));
+        assert!(!inbox.accept_for_tenant(Some(tenant_a), "sync-42"));
+        assert!(inbox.accept_for_tenant(Some(tenant_b), "sync-42"));
+        assert!(inbox.contains_for_tenant(Some(tenant_a), "sync-42"));
     }
 
     #[test]

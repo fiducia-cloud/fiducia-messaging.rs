@@ -18,6 +18,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 thiserror = "1"
 async-trait = "0.1"
+sha2 = "0.10"
 
 # The async `Publisher` trait's runtime + the relay binary's `#[tokio::main]`,
 # and the `#[tokio::test]` harness. No live services are touched by the tests.
@@ -39,7 +40,7 @@ sqlx = { version = "0.8", default-features = false, features = [
 
 # Optional: a real NATS JetStream publisher (the `nats` feature). The default
 # build must NOT pull this in — the crate builds and tests with no network.
-async-nats = { version = "0.38", optional = true }
+async-nats = { version = "0.49.1", default-features = false, features = ["jetstream", "ring"], optional = true }
 
 [features]
 default = []

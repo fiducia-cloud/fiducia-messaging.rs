@@ -71,3 +71,23 @@ CREATE TABLE IF NOT EXISTS message_inbox_consumer (
 CREATE INDEX IF NOT EXISTS message_inbox_consumer_retention_idx
     ON message_inbox_consumer (processed_at)
     WHERE processed_at IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- compat-service table: the codex-original outbox schema, kept separate from
+-- the integrated `message_outbox` above so the `compat-service` feature
+-- (src/transactional.rs) runs verbatim against its own table. Only created/used
+-- when the compat launcher is deployed; the integrated relay never touches it.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS message_outbox_compat (
+    message_id   uuid PRIMARY KEY,
+    tenant_id    uuid NOT NULL,
+    subject      text NOT NULL CHECK (length(trim(subject)) > 0),
+    envelope     bytea NOT NULL,
+    attempts     integer NOT NULL DEFAULT 0,
+    available_at timestamptz NOT NULL DEFAULT now(),
+    published_at timestamptz,
+    last_error   text,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS message_outbox_compat_pending_idx
+    ON message_outbox_compat (available_at, created_at) WHERE published_at IS NULL;
