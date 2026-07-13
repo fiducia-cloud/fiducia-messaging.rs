@@ -11,7 +11,7 @@ three share so every service speaks the bus the same way:
 
 It deliberately implements no queueing, persistence, or routing of its own —
 JetStream does that better than we would. The default build pulls in no NATS
-client and no database driver and needs no network: `cargo test` runs entirely
+client and no database driver and needs no network: `cargo test --locked` runs entirely
 in-memory.
 
 ## The core principle
@@ -174,9 +174,9 @@ The `fiducia-relay` binary (a thin outbox→JetStream drain loop) is built with
 `--features postgres,nats`; without them it prints a usage note.
 
 ```sh
-cargo test                                  # default, in-memory, no services
-cargo test --features postgres              # + DB-free schema checks
-cargo run --bin fiducia-relay --features postgres,nats
+cargo test --locked                              # default, in-memory, no services
+cargo test --locked --features postgres          # + DB-free schema checks
+cargo run --locked --bin fiducia-relay --features postgres,nats
 ```
 
 ## Configuration
@@ -213,7 +213,7 @@ then execs the command:
 ```bash
 git submodule update --init --recursive
 make -B -C vendor/flags-2-env all
-DATABASE_URL="$DATABASE_URL" NATS_URL="$NATS_URL" scripts/with-flags2env.sh --relay-batch=100 -- cargo run --bin fiducia-relay --features postgres,nats
+DATABASE_URL="$DATABASE_URL" NATS_URL="$NATS_URL" scripts/with-flags2env.sh --relay-batch=100 -- cargo run --locked --bin fiducia-relay --features postgres,nats
 ```
 
 The schema is audited in CI ([`.github/workflows/cli-flags.yml`](.github/workflows/cli-flags.yml)).
@@ -245,7 +245,7 @@ The NATS integration uses current `async-nats` with its Ring TLS backend, so its
 active all-features dependency graph is free of the former `rsa` and
 `rustls-webpki` advisory paths. `cargo audit` passes with one documented
 exception in `.cargo/audit.toml`: `rsa` remains only as unreachable
-`sqlx-mysql` metadata in `Cargo.lock`; `cargo tree --all-features --target all
+`sqlx-mysql` metadata in `Cargo.lock`; `cargo tree --locked --all-features --target all
 -i rsa` confirms that no build target can reach it.
 
 ## License
