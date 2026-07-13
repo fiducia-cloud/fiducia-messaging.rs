@@ -222,6 +222,11 @@ may embed credentials; inject both through the environment or a secret store.
 
 ## Security / hardening
 
+CI uses Rust `1.95.0`, locked Cargo resolution, warnings-as-errors Clippy, the
+all-features test suite, and a required advisory scan. The container uses that
+same exact Rust release for its build and an explicit numeric non-root
+distroless runtime; Dependabot tracks Cargo, actions, and Docker inputs weekly.
+
 - **All SQL is parameterized.** Every query binds values (`$1`, `$2`, …); no
   SQL is built by string concatenation. The `format!` calls in `src/subjects.rs`
   build NATS subject strings, not SQL.
