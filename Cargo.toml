@@ -1,0 +1,53 @@
+# Crate manifest for fiducia-messaging: a *library over NATS JetStream* — a
+# standard message envelope, the transactional outbox/inbox pattern, and the
+# subject taxonomy. It is NOT a broker: JetStream delivers, fiducia-node stays
+# the authority, Postgres holds state. The default build requires no external
+# services and no network (async-nats and sqlx are optional).
+[package]
+name = "fiducia-messaging"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+readme = "README.md"
+description = "Library over NATS JetStream for fiducia.cloud — a standard message envelope, the transactional outbox/inbox pattern, and the subject taxonomy. Not a broker: fiducia-node decides who may act; envelopes carry a fencing token + idempotency key for effectively-once external effects."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+thiserror = "1"
+async-trait = "0.1"
+
+# The async `Publisher` trait's runtime + the relay binary's `#[tokio::main]`,
+# and the `#[tokio::test]` harness. No live services are touched by the tests.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# Optional: a real Postgres-backed outbox/inbox repository (the `postgres`
+# feature). Runtime-checked queries only, so no DATABASE_URL is needed at build.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+], optional = true }
+
+# Optional: a real NATS JetStream publisher (the `nats` feature). The default
+# build must NOT pull this in — the crate builds and tests with no network.
+async-nats = { version = "0.38", optional = true }
+
+[features]
+default = []
+# Postgres-backed outbox/inbox repo + schema apply.
+postgres = ["dep:sqlx"]
+# Real JetStream `Publisher` (`NatsPublisher`).
+nats = ["dep:async-nats"]
+
+[[bin]]
+name = "fiducia-relay"
+path = "src/main.rs"
+
+[lib]
+name = "fiducia_messaging"
+path = "src/lib.rs"
