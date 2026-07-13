@@ -23,6 +23,32 @@ use uuid::Uuid;
 use crate::envelope::MessageEnvelope;
 use crate::error::MessagingError;
 use crate::publisher::Publisher;
+use crate::subjects::Subject;
+
+/// Maximum serialized message size the outbox will stage or the relay will
+/// publish, in bytes. Matches the NATS server default `max_payload` (1 MiB) so
+/// an oversize message is rejected at the boundary with a typed error instead
+/// of entering the outbox and failing every publish attempt. Deployments with a
+/// smaller server `max_payload` still get the broker's own rejection as the
+/// backstop.
+pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
+
+/// Validate that `subject` is a canonical `fiducia.<group>.<event>.v<version>`
+/// routing class and `payload_len` fits [`MAX_MESSAGE_BYTES`]. Shared by the
+/// enqueue path (`db::enqueue_outbox*`) and the drain paths ([`Relay::drain`],
+/// `db::OutboxPublisher`), so a subject assembled from an untrusted string
+/// (wildcards, injected `.` tokens, identifiers) or an oversize payload can
+/// neither enter the outbox nor reach NATS from pre-existing rows.
+pub fn validate_for_publish(subject: &str, payload_len: usize) -> Result<(), MessagingError> {
+    Subject::parse(subject)?;
+    if payload_len > MAX_MESSAGE_BYTES {
+        return Err(MessagingError::PayloadTooLarge {
+            actual: payload_len,
+            limit: MAX_MESSAGE_BYTES,
+        });
+    }
+    Ok(())
+}
 
 /// Lifecycle of an outbox row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
