@@ -153,7 +153,7 @@ Both are **off by default**; the crate builds and tests with neither.
 
 | feature | adds |
 | --- | --- |
-| `postgres` | `db` module — sqlx-backed outbox/inbox repo (`apply_schema`, `enqueue_outbox`, `claim_pending_outbox`, `mark_published`, `inbox_try_insert`, …). Runtime-checked queries, so no `DATABASE_URL` at build. Schema in [`sql/messaging.sql`](sql/messaging.sql). |
+| `postgres` | `db` module — sqlx-backed outbox/inbox repo (`apply_schema`, `enqueue_outbox`, `enqueue_outbox_tx`, `claim_pending_outbox`, `mark_published`, `inbox_try_insert`, …) plus `OutboxPublisher`; and the `inbox` module — the per-consumer `PgInbox`. Runtime-checked queries, so no `DATABASE_URL` at build. Schema lives in [`migrations/`](migrations/) (embedded as `db::SCHEMA_SQL`; run the dir with `sqlx::migrate!` or `db::apply_schema`). |
 | `nats` | `NatsPublisher` — a real JetStream `Publisher` that sets `Nats-Msg-Id` for publish dedup. |
 
 The `fiducia-relay` binary (a thin outbox→JetStream drain loop) is built with
