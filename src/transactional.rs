@@ -13,6 +13,20 @@ const COMPAT_MARK_PUBLISHED_SQL: &str =
 const COMPAT_RESCHEDULE_SQL: &str =
     "UPDATE message_outbox_compat SET attempts=attempts+1,last_error=$2,available_at=now()+least(interval '5 minutes', interval '1 second' * power(2, least(attempts, 8))) WHERE message_id=$1";
 
+/// Injection guard for compat subjects. The compat service historically
+/// accepted any non-empty subject, so this stays deliberately looser than the
+/// canonical taxonomy (`subjects::Subject::parse`) — but a subject assembled
+/// from an untrusted string must not smuggle NATS wildcards (`*`, `>`),
+/// whitespace/control characters, or empty tokens (leading/trailing/double
+/// dots) into the publish path.
+fn is_publishable_subject(subject: &str) -> bool {
+    !subject.trim().is_empty()
+        && !subject
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '*' || c == '>')
+        && subject.split('.').all(|token| !token.is_empty())
+}
+
 /// Transaction-scoped outbox facade retained from the original service.
 #[derive(Clone)]
 pub struct Outbox {
