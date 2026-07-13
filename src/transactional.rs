@@ -136,6 +136,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compat_subject_guard_blocks_injection() {
+        // Historic freedom is preserved: any dot-token subject without
+        // wildcards/whitespace is accepted, canonical or not.
+        assert!(is_publishable_subject("fiducia.executions.completed.v1"));
+        assert!(is_publishable_subject("legacy-subject"));
+        for bad in [
+            "",
+            "   ",
+            "fiducia..completed",
+            ".fiducia.executions",
+            "fiducia.executions.",
+            "fiducia.>",
+            "fiducia.*.v1",
+            "fiducia.exec utions",
+            "fiducia.exec\u{7}utions",
+        ] {
+            assert!(!is_publishable_subject(bad), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
     fn compatibility_queries_match_the_canonical_migration() {
         let schema = crate::db::SCHEMA_SQL;
         let (_, compat_and_rest) = schema
