@@ -354,5 +354,9 @@ mod tests {
         assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS message_inbox"));
         assert!(SCHEMA_SQL.contains("dedup_id"));
         assert!(SCHEMA_SQL.contains("idempotency_key"));
+        // Merged-in: codex's backoff columns + per-consumer inbox.
+        assert!(SCHEMA_SQL.contains("available_at"));
+        assert!(SCHEMA_SQL.contains("last_error"));
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS message_inbox_consumer"));
     }
 }
