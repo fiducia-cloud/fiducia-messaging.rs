@@ -237,8 +237,13 @@ impl<'a> Relay<'a> {
     }
 
     /// Publish every record in `batch`, collecting successes and failures. Never
-    /// panics: a serialize or transport failure on one row is recorded and the
-    /// drain continues.
+    /// panics: a serialize, validation, or transport failure on one row is
+    /// recorded and the drain continues.
+    ///
+    /// Each row is re-validated with [`validate_for_publish`] before it touches
+    /// the publisher, so a malformed subject (wildcard/injection) or an oversize
+    /// payload that reached the outbox by another path is failed here rather
+    /// than handed to NATS.
     pub async fn drain(&self, batch: &[OutboxRecord]) -> RelayOutcome {
         let mut outcome = RelayOutcome::default();
         for rec in batch {
@@ -249,6 +254,10 @@ impl<'a> Relay<'a> {
                     continue;
                 }
             };
+            if let Err(e) = validate_for_publish(&rec.subject, bytes.len()) {
+                outcome.failed.push((rec.id, e.to_string()));
+                continue;
+            }
             match self
                 .publisher
                 .publish(&rec.subject, &rec.dedup_id, &bytes)
