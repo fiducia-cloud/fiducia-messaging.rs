@@ -10,10 +10,8 @@
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Duration;
 
-    use chrono::Utc;
-    use fiducia_messaging::db;
-    use fiducia_messaging::outbox::Relay;
     use fiducia_messaging::publisher::NatsPublisher;
+    use fiducia_messaging::OutboxPublisher;
 
     let db_url = std::env::var("DATABASE_URL")
         .map_err(|_| "DATABASE_URL must be set (e.g. postgres://user:pass@host/db)")?;
@@ -25,30 +23,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(100);
 
     let pool = sqlx::PgPool::connect(&db_url).await?;
-    db::apply_schema(&pool).await?;
+    // Adopt the migrations dir: apply every tracked migration in `migrations/`.
+    sqlx::migrate!("./migrations").run(&pool).await?;
 
     let client = async_nats::connect(&nats_url).await?;
     let js = async_nats::jetstream::new(client);
     let publisher = NatsPublisher::new(js);
-    let relay = Relay::new(&publisher);
+
+    // The merged DB-coupled drainer: SKIP LOCKED batches, exponential backoff,
+    // retry metadata, and JetStream-ack-before-mark (via `NatsPublisher`). The
+    // pure `outbox::Relay` remains available for callers that own the DB dance.
+    let outbox = OutboxPublisher::new(&pool, &publisher).with_batch_size(batch_size);
 
     eprintln!("fiducia-relay: draining message_outbox -> {nats_url}");
-    loop {
-        let batch = db::claim_pending_outbox(&pool, batch_size).await?;
-        if batch.is_empty() {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            continue;
-        }
-        let outcome = relay.drain(&batch).await;
-        for id in outcome.published {
-            db::mark_published(&pool, id, Utc::now()).await?;
-        }
-        for (id, err) in outcome.failed {
-            eprintln!("fiducia-relay: publish {id} failed: {err}");
-            // Leave it pending to retry; a real deployment would cap attempts
-            // here and call db::mark_failed once exhausted.
-        }
-    }
+    outbox.run(Duration::from_millis(500)).await?;
+    Ok(())
 }
 
 #[cfg(not(all(feature = "postgres", feature = "nats")))]

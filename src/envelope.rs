@@ -13,10 +13,21 @@
 //!     *effectively-once* external effects over an at-least-once transport.
 
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::MessagingError;
+
+/// The current envelope *wire-format* version. Distinct from
+/// [`MessageEnvelope::schema_version`] (which versions the typed `payload`):
+/// this versions the envelope framing itself. Folded in from codex's
+/// `ENVELOPE_VERSION`; [`MessageEnvelope::validate`] rejects any other value.
+pub const ENVELOPE_VERSION: u16 = 1;
+
+fn default_envelope_version() -> u16 {
+    ENVELOPE_VERSION
+}
 
 /// A typed message plus the metadata every message on the bus carries.
 ///
@@ -25,10 +36,18 @@ use crate::error::MessagingError;
 /// `now` and the `message_id`), then chain the `with_*` builders.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MessageEnvelope<T> {
+    /// Envelope wire-format version (see [`ENVELOPE_VERSION`]). Defaults on
+    /// deserialize so envelopes written before this field decode cleanly.
+    #[serde(default = "default_envelope_version")]
+    pub envelope_version: u16,
     /// Unique id of *this* message. Doubles as the JetStream dedup id.
     pub message_id: Uuid,
     /// Stable routing/type name, e.g. `execution.completed`.
     pub message_type: String,
+    /// Producing service/component, e.g. `fiducia-node`. Folded in from codex's
+    /// envelope; optional here so pre-existing producers need not set it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// Payload schema version; bump on a breaking payload change.
     pub schema_version: u32,
     /// Ties every message in one logical flow together (the root message's id).
@@ -93,8 +112,10 @@ impl<T> MessageEnvelope<T> {
         idempotency_key: impl Into<String>,
     ) -> Self {
         MessageEnvelope {
+            envelope_version: ENVELOPE_VERSION,
             message_id,
             message_type: message_type.into(),
+            source: None,
             schema_version: 1,
             correlation_id: message_id,
             causation_id: None,
@@ -114,6 +135,29 @@ impl<T> MessageEnvelope<T> {
     pub fn with_schema_version(mut self, version: u32) -> Self {
         self.schema_version = version;
         self
+    }
+
+    /// Record the producing service/component (codex's `source`).
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    /// Validate the envelope framing. Folded from codex's `Envelope::validate`:
+    /// rejects an unknown [`envelope_version`](Self::envelope_version) and any
+    /// blank identity field (`message_type`, or a present-but-empty `source`).
+    pub fn validate(&self) -> Result<(), MessagingError> {
+        if self.envelope_version != ENVELOPE_VERSION {
+            return Err(MessagingError::UnsupportedEnvelopeVersion(
+                self.envelope_version,
+            ));
+        }
+        if self.message_type.trim().is_empty()
+            || self.source.as_deref().is_some_and(|s| s.trim().is_empty())
+        {
+            return Err(MessagingError::MissingIdentity);
+        }
+        Ok(())
     }
 
     /// Attach the authority [`fencing_token`](Self::fencing_token).
@@ -194,6 +238,25 @@ impl<T: Serialize> MessageEnvelope<T> {
     pub fn to_json_value(&self) -> Result<serde_json::Value, MessagingError> {
         Ok(serde_json::to_value(self)?)
     }
+
+    /// Validate then serialize to JSON bytes. Folded from codex's
+    /// `Envelope::encode`: unlike [`to_vec`](Self::to_vec), this refuses to emit
+    /// an envelope that fails [`validate`](Self::validate).
+    pub fn encode(&self) -> Result<Vec<u8>, MessagingError> {
+        self.validate()?;
+        self.to_vec()
+    }
+}
+
+impl<T: DeserializeOwned> MessageEnvelope<T> {
+    /// Deserialize from JSON bytes and [`validate`](Self::validate). Folded from
+    /// codex's `Envelope::decode`: a wrong-version or identity-less envelope is
+    /// rejected at the boundary rather than flowing into a handler.
+    pub fn decode(bytes: &[u8]) -> Result<Self, MessagingError> {
+        let envelope: Self = serde_json::from_slice(bytes)?;
+        envelope.validate()?;
+        Ok(envelope)
+    }
 }
 
 #[cfg(test)]
@@ -264,13 +327,8 @@ mod tests {
 
     #[test]
     fn require_fencing_token_ok_and_err() {
-        let base = MessageEnvelope::new_at(
-            fixed_now(),
-            fixed_id(),
-            "runner.command",
-            (),
-            "idem-cmd",
-        );
+        let base =
+            MessageEnvelope::new_at(fixed_now(), fixed_id(), "runner.command", (), "idem-cmd");
 
         // Missing token -> typed error naming the message_type.
         let err = base.require_fencing_token().unwrap_err();
@@ -287,8 +345,8 @@ mod tests {
     #[test]
     fn expiry_is_deterministic() {
         let expires = fixed_now();
-        let env = MessageEnvelope::new_at(fixed_now(), fixed_id(), "t", (), "k")
-            .with_expiry(expires);
+        let env =
+            MessageEnvelope::new_at(fixed_now(), fixed_id(), "t", (), "k").with_expiry(expires);
 
         assert!(!env.is_expired(expires - chrono::Duration::seconds(1)));
         assert!(env.is_expired(expires)); // at the boundary
@@ -306,5 +364,50 @@ mod tests {
         assert_eq!(env.correlation_id, env.message_id);
         assert_eq!(env.idempotency_key, "k");
         assert_eq!(env.fencing_token, None);
+        assert_eq!(env.envelope_version, ENVELOPE_VERSION);
+        assert_eq!(env.source, None);
+    }
+
+    // Folded from codex: envelope-version framing + validating encode/decode.
+    #[test]
+    fn encode_decode_round_trips_and_validates() {
+        let env = MessageEnvelope::new_at(fixed_now(), fixed_id(), "claim.created", (), "k")
+            .with_source("fiducia-node");
+        let bytes = env.encode().expect("encode");
+        let back: MessageEnvelope<()> = MessageEnvelope::decode(&bytes).expect("decode");
+        assert_eq!(env, back);
+        assert_eq!(back.source.as_deref(), Some("fiducia-node"));
+    }
+
+    #[test]
+    fn decode_rejects_unknown_envelope_version() {
+        let mut env = MessageEnvelope::new_at(fixed_now(), fixed_id(), "t", (), "k");
+        env.envelope_version = 9;
+        let bytes = env.to_vec().unwrap(); // to_vec skips validation
+        let err = MessageEnvelope::<()>::decode(&bytes).unwrap_err();
+        assert!(matches!(err, MessagingError::UnsupportedEnvelopeVersion(9)));
+    }
+
+    #[test]
+    fn validate_rejects_blank_identity() {
+        let env = MessageEnvelope::new_at(fixed_now(), fixed_id(), "", (), "k");
+        assert!(matches!(
+            env.validate(),
+            Err(MessagingError::MissingIdentity)
+        ));
+        let blank_source =
+            MessageEnvelope::new_at(fixed_now(), fixed_id(), "t", (), "k").with_source("  ");
+        assert!(matches!(
+            blank_source.validate(),
+            Err(MessagingError::MissingIdentity)
+        ));
+    }
+
+    #[test]
+    fn missing_envelope_version_defaults_on_decode() {
+        // An older producer's JSON without `envelope_version` still decodes.
+        let json = r#"{"message_id":"11111111-1111-4111-8111-111111111111","message_type":"t","schema_version":1,"correlation_id":"11111111-1111-4111-8111-111111111111","idempotency_key":"k","created_at":"2026-07-12T08:30:00Z","payload":null}"#;
+        let env: MessageEnvelope<()> = serde_json::from_str(json).unwrap();
+        assert_eq!(env.envelope_version, ENVELOPE_VERSION);
     }
 }
