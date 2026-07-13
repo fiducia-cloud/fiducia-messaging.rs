@@ -26,6 +26,18 @@ pub enum MessagingError {
         expired_at: DateTime<Utc>,
     },
 
+    /// An envelope's `envelope_version` is not one this build understands.
+    /// Folded from codex's `EnvelopeError::UnsupportedVersion` so a peer on a
+    /// newer wire format is rejected rather than silently mis-decoded.
+    #[error("unsupported envelope version {0}")]
+    UnsupportedEnvelopeVersion(u16),
+
+    /// An envelope failed validation because a required identity field
+    /// (`message_type`, or a present-but-blank `source`) was empty. Folded from
+    /// codex's `EnvelopeError::MissingIdentity`.
+    #[error("message_type and source must be non-empty")]
+    MissingIdentity,
+
     /// Payload (de)serialization failed.
     #[error("serialize/deserialize failed: {0}")]
     Serialize(#[from] serde_json::Error),
