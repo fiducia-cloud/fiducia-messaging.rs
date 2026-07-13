@@ -103,6 +103,7 @@ pub async fn claim_pending_outbox(
           WHERE id IN (
               SELECT id FROM message_outbox
                WHERE status = 'pending'
+                 AND available_at <= now()
                ORDER BY created_at
                LIMIT $1
                FOR UPDATE SKIP LOCKED
