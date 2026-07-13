@@ -165,6 +165,60 @@ cargo test --features postgres              # + DB-free schema checks
 cargo run --bin fiducia-relay --features postgres,nats
 ```
 
+## Configuration
+
+The `fiducia-relay` binary (feature `postgres,nats`) reads its whole config from
+the environment (`src/main.rs`):
+
+| var | required | secret | description |
+| --- | --- | --- | --- |
+| `DATABASE_URL` | yes | **yes** | Postgres connection string, e.g. `postgres://user:pass@host/db`. **Carries DB credentials** — never log it, keep it out of shell history and CI logs. The relay exits if it is unset. |
+| `NATS_URL` | no | no | NATS server URL. Defaults to `nats://localhost:4222`. May embed credentials if your deployment uses `nats://user:pass@host`; treat as secret then. |
+| `RELAY_BATCH` | no | no | Integer — outbox rows claimed per drain batch. Defaults to `100`; unparseable values fall back to the default. |
+
+The `fiducia-messaging-compat` binary (feature `compat-service`) reads
+`DATABASE_URL` and `NATS_URL` with the same meaning (both required there).
+
+### flags-2-env
+
+Config can be driven from CLI flags instead of raw env vars, via the pinned
+[`ORESoftware/flags-2-env`](https://github.com/ORESoftware/flags-2-env) parser
+and the [`.cli-flags.toml`](.cli-flags.toml) schema, which maps each flag to the
+env var above. `scripts/with-flags2env.sh` runs the parser, exports the env map,
+then execs the command:
+
+```bash
+git submodule update --init --recursive
+make -C vendor/flags-2-env all
+scripts/with-flags2env.sh --database-url=postgres://user:pass@host/db --nats-url=nats://localhost:4222 --relay-batch=100 -- cargo run --bin fiducia-relay --features postgres,nats
+```
+
+The schema is audited in CI ([`.github/workflows/cli-flags.yml`](.github/workflows/cli-flags.yml)).
+
+## Security / hardening
+
+- **All SQL is parameterized.** Every query binds values (`$1`, `$2`, …); no
+  SQL is built by string concatenation. The `format!` calls in `src/subjects.rs`
+  build NATS subject strings, not SQL.
+- **`DATABASE_URL` carries credentials and is never logged.** The relay prints
+  only the (credential-free) `NATS_URL` target on startup; the DB URL is passed
+  straight to the pool.
+
+### Accepted advisories
+
+`cargo audit` reports the following, which are **accepted** and must not be
+force-fixed:
+
+- **`rsa` RUSTSEC-2023-0071** (Marvin timing sidechannel) — transitive
+  dependency with **no upstream fix available**. Reachable only under the `nats`
+  feature.
+- **`rustls-webpki` advisories** (RUSTSEC-2026-0049 / 0098 / 0099 / 0104) —
+  pulled in **only** by `async-nats 0.38` behind the optional `nats` feature,
+  which connects to a **trusted, operator-controlled NATS server**, not
+  attacker-supplied certificates. Fixing requires a **breaking `async-nats` major
+  bump**; the upgrade is tracked for the next `async-nats` major. The default,
+  network-free build pulls in none of this.
+
 ## License
 
 MIT
