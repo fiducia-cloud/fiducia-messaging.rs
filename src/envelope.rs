@@ -238,6 +238,25 @@ impl<T: Serialize> MessageEnvelope<T> {
     pub fn to_json_value(&self) -> Result<serde_json::Value, MessagingError> {
         Ok(serde_json::to_value(self)?)
     }
+
+    /// Validate then serialize to JSON bytes. Folded from codex's
+    /// `Envelope::encode`: unlike [`to_vec`](Self::to_vec), this refuses to emit
+    /// an envelope that fails [`validate`](Self::validate).
+    pub fn encode(&self) -> Result<Vec<u8>, MessagingError> {
+        self.validate()?;
+        self.to_vec()
+    }
+}
+
+impl<T: DeserializeOwned> MessageEnvelope<T> {
+    /// Deserialize from JSON bytes and [`validate`](Self::validate). Folded from
+    /// codex's `Envelope::decode`: a wrong-version or identity-less envelope is
+    /// rejected at the boundary rather than flowing into a handler.
+    pub fn decode(bytes: &[u8]) -> Result<Self, MessagingError> {
+        let envelope: Self = serde_json::from_slice(bytes)?;
+        envelope.validate()?;
+        Ok(envelope)
+    }
 }
 
 #[cfg(test)]
