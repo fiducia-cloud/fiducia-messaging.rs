@@ -14,8 +14,16 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::error::MessagingError;
-use crate::outbox::{OutboxRecord, OutboxStatus};
+use crate::outbox::{validate_for_publish, OutboxRecord, OutboxStatus};
 use crate::publisher::Publisher;
+
+/// Validate a record before it is staged: canonical subject (no wildcard /
+/// injected tokens) and serialized payload within
+/// [`MAX_MESSAGE_BYTES`](crate::outbox::MAX_MESSAGE_BYTES).
+fn validate_outbox_record(rec: &OutboxRecord) -> Result<(), MessagingError> {
+    let payload_len = serde_json::to_vec(&rec.payload)?.len();
+    validate_for_publish(&rec.subject, payload_len)
+}
 
 /// The messaging schema DDL, embedded from the first migration. Idempotent, so
 /// [`apply_schema`] can run it directly and `sqlx::migrate!` can run the same
