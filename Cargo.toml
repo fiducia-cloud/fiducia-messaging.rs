@@ -31,6 +31,9 @@ sqlx = { version = "0.8", default-features = false, features = [
     "uuid",
     "chrono",
     "json",
+    # `migrate` powers the `migrations/` dir (both `sqlx::migrate!` in the relay
+    # binary and, indirectly, the embedded `db::SCHEMA_SQL`).
+    "migrate",
 ], optional = true }
 
 # Optional: a real NATS JetStream publisher (the `nats` feature). The default
