@@ -414,6 +414,71 @@ mod tests {
         assert_eq!(publisher.len(), 1);
     }
 
+    #[test]
+    fn validate_for_publish_enforces_taxonomy_and_size() {
+        assert!(validate_for_publish("fiducia.executions.completed.v1", 10).is_ok());
+        assert!(validate_for_publish("fiducia.executions.completed.v1", MAX_MESSAGE_BYTES).is_ok());
+        // NATS wildcards and malformed shapes are rejected.
+        assert!(matches!(
+            validate_for_publish("fiducia.executions.*.v1", 10),
+            Err(MessagingError::InvalidSubject(_))
+        ));
+        assert!(matches!(
+            validate_for_publish("fiducia.executions.>", 10),
+            Err(MessagingError::InvalidSubject(_))
+        ));
+        // A tenant-controlled token cannot forge extra subject levels.
+        assert!(matches!(
+            validate_for_publish("fiducia.executions.completed.v1.tenant-b", 10),
+            Err(MessagingError::InvalidSubject(_))
+        ));
+        assert!(matches!(
+            validate_for_publish("fiducia.executions.completed.v1", MAX_MESSAGE_BYTES + 1),
+            Err(MessagingError::PayloadTooLarge {
+                actual,
+                limit: MAX_MESSAGE_BYTES,
+            }) if actual == MAX_MESSAGE_BYTES + 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn relay_fails_injected_subjects_without_publishing() {
+        let publisher = RecordingPublisher::new();
+        let relay = Relay::new(&publisher);
+        let mut wildcard = rec(1, "d-1");
+        wildcard.subject = "fiducia.executions.>".into();
+        let mut forged_level = rec(2, "d-2");
+        forged_level.subject = "fiducia.executions.completed.v1.evil".into();
+        let batch = vec![wildcard, forged_level, rec(3, "d-3")];
+
+        let outcome = relay.drain(&batch).await;
+
+        assert_eq!(outcome.published, vec![id(3)]);
+        assert_eq!(outcome.failed_count(), 2);
+        assert!(outcome.failed[0].1.contains("invalid publish subject"));
+        // Only the canonical routing class reached the bus.
+        assert_eq!(publisher.len(), 1);
+        assert_eq!(
+            publisher.published()[0].subject,
+            "fiducia.executions.completed.v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_fails_oversize_payloads_without_publishing() {
+        let publisher = RecordingPublisher::new();
+        let relay = Relay::new(&publisher);
+        let mut oversize = rec(1, "d-1");
+        oversize.payload = serde_json::json!({ "blob": "x".repeat(MAX_MESSAGE_BYTES) });
+
+        let outcome = relay.drain(&[oversize]).await;
+
+        assert!(outcome.published.is_empty());
+        assert_eq!(outcome.failed_count(), 1);
+        assert!(outcome.failed[0].1.contains("limit is"));
+        assert!(publisher.is_empty());
+    }
+
     #[tokio::test]
     async fn relay_records_publisher_failure_without_crashing() {
         struct FailingPublisher;
