@@ -26,7 +26,7 @@ impl Outbox {
         }
         let body = envelope.encode()?;
         sqlx::query(
-            "INSERT INTO message_outbox (message_id, tenant_id, subject, envelope) VALUES ($1,$2,$3,$4)",
+            "INSERT INTO message_outbox_compat (message_id, tenant_id, subject, envelope) VALUES ($1,$2,$3,$4)",
         )
         .bind(envelope.message_id)
         .bind(envelope.tenant_id)
@@ -56,7 +56,7 @@ impl OutboxPublisher {
     pub async fn publish_batch(&self) -> Result<u64, OutboxError> {
         let mut tx = self.pool.begin().await?;
         let rows: Vec<(Uuid, String, Vec<u8>)> = sqlx::query_as(
-            "SELECT message_id, subject, envelope FROM message_outbox WHERE published_at IS NULL AND available_at <= now() ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT $1",
+            "SELECT message_id, subject, envelope FROM message_outbox_compat WHERE published_at IS NULL AND available_at <= now() ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT $1",
         )
         .bind(self.batch_size)
         .fetch_all(&mut *tx)
@@ -69,14 +69,14 @@ impl OutboxPublisher {
                         .flush()
                         .await
                         .map_err(|error| OutboxError::Nats(error.to_string()))?;
-                    sqlx::query("UPDATE message_outbox SET published_at=now(), attempts=attempts+1, last_error=NULL WHERE message_id=$1")
+                    sqlx::query("UPDATE message_outbox_compat SET published_at=now(), attempts=attempts+1, last_error=NULL WHERE message_id=$1")
                         .bind(message_id)
                         .execute(&mut *tx)
                         .await?;
                     published += 1;
                 }
                 Err(error) => {
-                    sqlx::query("UPDATE message_outbox SET attempts=attempts+1,last_error=$2,available_at=now()+least(interval '5 minutes', interval '1 second' * power(2, least(attempts, 8))) WHERE message_id=$1")
+                    sqlx::query("UPDATE message_outbox_compat SET attempts=attempts+1,last_error=$2,available_at=now()+least(interval '5 minutes', interval '1 second' * power(2, least(attempts, 8))) WHERE message_id=$1")
                         .bind(message_id)
                         .bind(error.to_string())
                         .execute(&mut *tx)
