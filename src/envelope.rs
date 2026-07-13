@@ -369,5 +369,53 @@ mod tests {
         assert_eq!(env.correlation_id, env.message_id);
         assert_eq!(env.idempotency_key, "k");
         assert_eq!(env.fencing_token, None);
+        assert_eq!(env.envelope_version, ENVELOPE_VERSION);
+        assert_eq!(env.source, None);
+    }
+
+    // Folded from codex: envelope-version framing + validating encode/decode.
+    #[test]
+    fn encode_decode_round_trips_and_validates() {
+        let env = MessageEnvelope::new_at(fixed_now(), fixed_id(), "claim.created", (), "k")
+            .with_source("fiducia-node");
+        let bytes = env.encode().expect("encode");
+        let back: MessageEnvelope<()> = MessageEnvelope::decode(&bytes).expect("decode");
+        assert_eq!(env, back);
+        assert_eq!(back.source.as_deref(), Some("fiducia-node"));
+    }
+
+    #[test]
+    fn decode_rejects_unknown_envelope_version() {
+        let mut env = MessageEnvelope::new_at(fixed_now(), fixed_id(), "t", (), "k");
+        env.envelope_version = 9;
+        let bytes = env.to_vec().unwrap(); // to_vec skips validation
+        let err = MessageEnvelope::<()>::decode(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            MessagingError::UnsupportedEnvelopeVersion(9)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_blank_identity() {
+        let env = MessageEnvelope::new_at(fixed_now(), fixed_id(), "", (), "k");
+        assert!(matches!(
+            env.validate(),
+            Err(MessagingError::MissingIdentity)
+        ));
+        let blank_source =
+            MessageEnvelope::new_at(fixed_now(), fixed_id(), "t", (), "k").with_source("  ");
+        assert!(matches!(
+            blank_source.validate(),
+            Err(MessagingError::MissingIdentity)
+        ));
+    }
+
+    #[test]
+    fn missing_envelope_version_defaults_on_decode() {
+        // An older producer's JSON without `envelope_version` still decodes.
+        let json = r#"{"message_id":"11111111-1111-4111-8111-111111111111","message_type":"t","schema_version":1,"correlation_id":"11111111-1111-4111-8111-111111111111","idempotency_key":"k","created_at":"2026-07-12T08:30:00Z","payload":null}"#;
+        let env: MessageEnvelope<()> = serde_json::from_str(json).unwrap();
+        assert_eq!(env.envelope_version, ENVELOPE_VERSION);
     }
 }
