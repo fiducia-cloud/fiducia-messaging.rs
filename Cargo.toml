@@ -47,10 +47,19 @@ default = []
 postgres = ["dep:sqlx"]
 # Real JetStream `Publisher` (`NatsPublisher`).
 nats = ["dep:async-nats"]
+# The original codex-authored direct PostgreSQL/NATS service, preserved verbatim
+# for wire/API backward-compat: `transactional::{Outbox, OutboxPublisher}` over
+# `compat_envelope::Envelope`, plus the `fiducia-messaging-compat` binary.
+compat-service = ["postgres", "nats"]
 
 [[bin]]
 name = "fiducia-relay"
 path = "src/main.rs"
+
+[[bin]]
+name = "fiducia-messaging-compat"
+path = "src/bin/fiducia-messaging-compat.rs"
+required-features = ["compat-service"]
 
 [lib]
 name = "fiducia_messaging"
