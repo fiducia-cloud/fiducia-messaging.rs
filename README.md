@@ -86,14 +86,38 @@ on restart — and JetStream drops the duplicate because the row's `dedup_id` is
 sent as the `Nats-Msg-Id` header (server-side publish dedup). The in-memory
 `RecordingPublisher` mirrors that dedup so the same guarantee is unit-tested.
 
-`Relay` is pure: hand it a claimed batch and a `&dyn Publisher` and it returns a
-`RelayOutcome { published, failed }`; it holds no state and touches no DB, so a
-serialize/transport failure on one row is recorded and the drain continues.
+There are **two publishers**, sharing one `message_outbox` table:
 
-**Consumers** get the mirror image via `Inbox` (in-memory) or `message_inbox`
-(`db::inbox_try_insert`): record the incoming `message_id` before running the
-effect; a duplicate delivery loses the insert and is skipped, so the external
-effect runs at most once.
+- `outbox::Relay` — pure and transport-agnostic. Hand it a claimed batch and a
+  `&dyn Publisher` and it returns a `RelayOutcome { published, failed }`; it
+  holds no state and touches no DB, so a serialize/transport failure on one row
+  is recorded and the drain continues. You own the claim/mark DB calls.
+- `db::OutboxPublisher` (feature `postgres`) — DB-coupled. `publish_batch()`
+  claims a bounded batch of *due* pending rows with `FOR UPDATE SKIP LOCKED`,
+  publishes each through the `Publisher`, and records the outcome in one
+  transaction with **exponential backoff** (`available_at`), **durable retry
+  metadata** (`attempts`, `last_error`), and a `failed` park once attempts are
+  exhausted. `NatsPublisher` awaits the JetStream publish-ack before returning,
+  so a row is marked `published` only after the broker durably stored it
+  (NATS-flush-before-mark). `run(interval)` drains forever.
+
+**Consumers** get the mirror image, and there are likewise **two inboxes**:
+
+- `outbox::Inbox` — in-memory guard (part of the offline core): `accept(key)`
+  returns `false` for a duplicate. `db::inbox_try_insert` is its Postgres
+  message-id-keyed equivalent (`message_inbox`) — a message is consumed once
+  *globally*.
+- `PgInbox` (feature `postgres`, from the `inbox` module) — a Postgres
+  **per-consumer** claim (`message_inbox_consumer`, `PRIMARY KEY (consumer,
+  message_id)`). Inside the same transaction as its side effect a consumer calls
+  `Inbox::begin(tx, consumer, &envelope)` → `InboxDecision::{Process, Duplicate}`
+  and, on success, `mark_processed(...)`. Because the claim is per-consumer, the
+  same message can be independently, idempotently processed by several
+  consumers, each obtaining effective exactly-once side effects.
+
+Either way: record the incoming message before running the effect; a duplicate
+delivery loses the insert and is skipped, so the external effect runs at most
+once.
 
 ## Subject taxonomy
 
