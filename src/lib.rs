@@ -63,8 +63,12 @@ pub mod subjects;
 #[cfg(feature = "postgres")]
 pub mod db;
 
+/// Per-consumer Postgres inbox (grafted from codex). Behind `postgres`.
+#[cfg(feature = "postgres")]
+pub mod inbox;
+
 // Key types, re-exported at the crate root.
-pub use envelope::MessageEnvelope;
+pub use envelope::{MessageEnvelope, ENVELOPE_VERSION};
 pub use error::MessagingError;
 pub use outbox::{Inbox, InboxRecord, OutboxRecord, OutboxStatus, Relay, RelayOutcome};
 pub use publisher::{PublishedMessage, Publisher, RecordingPublisher};
@@ -72,3 +76,16 @@ pub use subjects::{Subject, SubjectError};
 
 #[cfg(feature = "nats")]
 pub use publisher::NatsPublisher;
+
+// RECONCILE: two inboxes coexist. `Inbox` (above, from `outbox`) is the
+// in-memory, message-id/idempotency-key guard that runs in the default offline
+// build. `PgInbox` (below, from `inbox`) is codex's Postgres per-consumer claim.
+// Distinct root names avoid the collision; both keep their own module-local name
+// `Inbox`.
+#[cfg(feature = "postgres")]
+pub use inbox::{Inbox as PgInbox, InboxDecision, InboxError};
+
+/// The DB-coupled outbox drainer (SKIP LOCKED + backoff + retry metadata).
+/// Behind `postgres`. The pure, transport-agnostic alternative is [`Relay`].
+#[cfg(feature = "postgres")]
+pub use db::OutboxPublisher;
