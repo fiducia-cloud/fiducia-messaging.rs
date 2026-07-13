@@ -24,7 +24,7 @@ the rule:
 
 | field | purpose |
 | --- | --- |
-| `idempotency_key` | Business key for the effect this message drives. A redelivery collapses to a single external effect (**at-most-once**). |
+| `idempotency_key` | Business key for the effect this message drives, scoped by `tenant_id` (or the explicit global namespace). A redelivery collapses to a single external effect (**at-most-once**). |
 | `fencing_token` | Monotonic authority token from fiducia-node (a lock/lease). A handler about to mutate the outside world must present it; a stale holder's token is rejected. |
 
 Over an at-least-once transport these give **effectively-once** external
@@ -81,32 +81,44 @@ change, then relay it out-of-band.
         mark rows published
 ```
 
+`OutboxRecord::from_envelope` stores the raw business key with its tenant and
+derives a fixed-size SHA-256 `dedup_id` from `(tenant_id, idempotency_key)`.
+That digest, not the globally raw business key, is sent as `Nats-Msg-Id`. The
+same key is therefore idempotent inside one tenant while remaining independent
+across tenants. The explicit `None` tenant is a separate global namespace.
+
 If the relay crashes after publishing but before marking a row, it republishes
-on restart — and JetStream drops the duplicate because the row's `dedup_id` is
-sent as the `Nats-Msg-Id` header (server-side publish dedup). The in-memory
-`RecordingPublisher` mirrors that dedup so the same guarantee is unit-tested.
+on restart and JetStream drops the duplicate within its configured publish
+dedup window. The durable outbox uniqueness constraint prevents a completed
+business key from being re-enqueued after that broker window. The in-memory
+`RecordingPublisher` mirrors publish dedup so the retry guarantee is unit-tested.
 
 There are **two publishers**, sharing one `message_outbox` table:
 
 - `outbox::Relay` — pure and transport-agnostic. Hand it a claimed batch and a
   `&dyn Publisher` and it returns a `RelayOutcome { published, failed }`; it
   holds no state and touches no DB, so a serialize/transport failure on one row
-  is recorded and the drain continues. You own the claim/mark DB calls.
+  is recorded and the drain continues. You own the claim/mark DB calls; use a
+  unique owner UUID with `claim_pending_outbox` and pass that same owner to the
+  conditional mark/reschedule functions.
 - `db::OutboxPublisher` (feature `postgres`) — DB-coupled. `publish_batch()`
-  claims a bounded batch of *due* pending rows with `FOR UPDATE SKIP LOCKED`,
-  publishes each through the `Publisher`, and records the outcome in one
-  transaction with **exponential backoff** (`available_at`), **durable retry
-  metadata** (`attempts`, `last_error`), and a `failed` park once attempts are
-  exhausted. `NatsPublisher` awaits the JetStream publish-ack before returning,
-  so a row is marked `published` only after the broker durably stored it
-  (NATS-flush-before-mark). `run(interval)` drains forever.
+  atomically commits a bounded batch of *due* rows with a `claim_owner` and
+  expiring `claim_expires_at`, then publishes outside any database transaction.
+  Concurrent relays skip live claims; a crashed relay's rows become reclaimable.
+  Success, backoff, and failure updates only land while the owner still matches,
+  preventing stale workers from changing a reclaimed row. It retains
+  **exponential backoff** (`available_at`), **durable retry metadata**
+  (`attempts`, `last_error`), and a `failed` park after exhausted attempts.
+  `NatsPublisher` awaits the JetStream publish acknowledgement before the
+  owner-conditioned published mark. `run(interval)` drains forever.
 
 **Consumers** get the mirror image, and there are likewise **two inboxes**:
 
-- `outbox::Inbox` — in-memory guard (part of the offline core): `accept(key)`
-  returns `false` for a duplicate. `db::inbox_try_insert` is its Postgres
-  message-id-keyed equivalent (`message_inbox`) — a message is consumed once
-  *globally*.
+- `outbox::Inbox` — in-memory guard (part of the offline core):
+  `accept_for_tenant(tenant_id, key)` returns `false` for a duplicate within
+  that tenant. `accept(key)` is the explicit global-namespace shorthand.
+  `db::inbox_try_insert_scoped` is its Postgres equivalent; the legacy
+  `inbox_try_insert` wrapper uses the global namespace.
 - `PgInbox` (feature `postgres`, from the `inbox` module) — a Postgres
   **per-consumer** claim (`message_inbox_consumer`, `PRIMARY KEY (consumer,
   message_id)`). Inside the same transaction as its side effect a consumer calls
@@ -153,7 +165,7 @@ Both are **off by default**; the crate builds and tests with neither.
 
 | feature | adds |
 | --- | --- |
-| `postgres` | `db` module — sqlx-backed outbox/inbox repo (`apply_schema`, `enqueue_outbox`, `enqueue_outbox_tx`, `claim_pending_outbox`, `mark_published`, `inbox_try_insert`, …) plus `OutboxPublisher`; and the `inbox` module — the per-consumer `PgInbox`. Runtime-checked queries, so no `DATABASE_URL` at build. Schema lives in [`migrations/`](migrations/) (embedded as `db::SCHEMA_SQL`; run the dir with `sqlx::migrate!` or `db::apply_schema`). |
+| `postgres` | `db` module — sqlx-backed outbox/inbox repo (`apply_schema`, `enqueue_outbox`, `enqueue_outbox_tx`, leased `claim_pending_outbox`, owner-conditioned marks, scoped inbox, …) plus `OutboxPublisher`; and the `inbox` module — the per-consumer `PgInbox`. Runtime-checked queries, so no `DATABASE_URL` at build. Forward-only schema files live in [`migrations/`](migrations/) and are embedded as `db::SCHEMA_SQL` / `db::HARDENING_SCHEMA_SQL`; run the directory with `sqlx::migrate!` or use `db::apply_schema`. |
 | `nats` | `NatsPublisher` — a real JetStream `Publisher` that sets `Nats-Msg-Id` for publish dedup. |
 
 The `fiducia-relay` binary (a thin outbox→JetStream drain loop) is built with
@@ -178,6 +190,11 @@ the environment (`src/main.rs`):
 
 The `fiducia-messaging-compat` binary (feature `compat-service`) reads
 `DATABASE_URL` and `NATS_URL` with the same meaning (both required there).
+Its legacy byte-envelope queries use the dedicated
+`message_outbox_compat` table created by migration 0001, not the integrated
+`message_outbox` shape. An all-features schema-contract test checks every column
+used by those queries so compatibility builds fail visibly if migration and code
+drift again.
 
 ### flags-2-env
 
@@ -203,6 +220,12 @@ The schema is audited in CI ([`.github/workflows/cli-flags.yml`](.github/workflo
 - **`DATABASE_URL` carries credentials and is never logged.** The relay prints
   only the (credential-free) `NATS_URL` target on startup; the DB URL is passed
   straight to the pool.
+- **Tenant idempotency is explicit.** The database constrains raw business keys
+  per tenant (or in the separate global namespace), while `Nats-Msg-Id` is a
+  bounded digest of that same scope and key.
+- **Relay claims are durable and fenced by owner.** Claim ownership and expiry
+  are committed before network I/O. Every terminal update compares the owner;
+  abandoned rows become claimable after their lease expires.
 
 ### Accepted advisories
 

@@ -4,6 +4,15 @@ use sqlx::{PgPool, Postgres, Transaction};
 use std::time::Duration;
 use uuid::Uuid;
 
+const COMPAT_ENQUEUE_SQL: &str =
+    "INSERT INTO message_outbox_compat (message_id, tenant_id, subject, envelope) VALUES ($1,$2,$3,$4)";
+const COMPAT_CLAIM_SQL: &str =
+    "SELECT message_id, subject, envelope FROM message_outbox_compat WHERE published_at IS NULL AND available_at <= now() ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT $1";
+const COMPAT_MARK_PUBLISHED_SQL: &str =
+    "UPDATE message_outbox_compat SET published_at=now(), attempts=attempts+1, last_error=NULL WHERE message_id=$1";
+const COMPAT_RESCHEDULE_SQL: &str =
+    "UPDATE message_outbox_compat SET attempts=attempts+1,last_error=$2,available_at=now()+least(interval '5 minutes', interval '1 second' * power(2, least(attempts, 8))) WHERE message_id=$1";
+
 /// Transaction-scoped outbox facade retained from the original service.
 #[derive(Clone)]
 pub struct Outbox {
@@ -25,15 +34,13 @@ impl Outbox {
             return Err(OutboxError::InvalidSubject);
         }
         let body = envelope.encode()?;
-        sqlx::query(
-            "INSERT INTO message_outbox_compat (message_id, tenant_id, subject, envelope) VALUES ($1,$2,$3,$4)",
-        )
-        .bind(envelope.message_id)
-        .bind(envelope.tenant_id)
-        .bind(subject)
-        .bind(body)
-        .execute(&mut **tx)
-        .await?;
+        sqlx::query(COMPAT_ENQUEUE_SQL)
+            .bind(envelope.message_id)
+            .bind(envelope.tenant_id)
+            .bind(subject)
+            .bind(body)
+            .execute(&mut **tx)
+            .await?;
         Ok(())
     }
 }
@@ -55,12 +62,10 @@ impl OutboxPublisher {
 
     pub async fn publish_batch(&self) -> Result<u64, OutboxError> {
         let mut tx = self.pool.begin().await?;
-        let rows: Vec<(Uuid, String, Vec<u8>)> = sqlx::query_as(
-            "SELECT message_id, subject, envelope FROM message_outbox_compat WHERE published_at IS NULL AND available_at <= now() ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT $1",
-        )
-        .bind(self.batch_size)
-        .fetch_all(&mut *tx)
-        .await?;
+        let rows: Vec<(Uuid, String, Vec<u8>)> = sqlx::query_as(COMPAT_CLAIM_SQL)
+            .bind(self.batch_size)
+            .fetch_all(&mut *tx)
+            .await?;
         let mut published = 0;
         for (message_id, subject, body) in rows {
             match self.nats.publish(subject, body.into()).await {
@@ -69,14 +74,14 @@ impl OutboxPublisher {
                         .flush()
                         .await
                         .map_err(|error| OutboxError::Nats(error.to_string()))?;
-                    sqlx::query("UPDATE message_outbox_compat SET published_at=now(), attempts=attempts+1, last_error=NULL WHERE message_id=$1")
+                    sqlx::query(COMPAT_MARK_PUBLISHED_SQL)
                         .bind(message_id)
                         .execute(&mut *tx)
                         .await?;
                     published += 1;
                 }
                 Err(error) => {
-                    sqlx::query("UPDATE message_outbox_compat SET attempts=attempts+1,last_error=$2,available_at=now()+least(interval '5 minutes', interval '1 second' * power(2, least(attempts, 8))) WHERE message_id=$1")
+                    sqlx::query(COMPAT_RESCHEDULE_SQL)
                         .bind(message_id)
                         .bind(error.to_string())
                         .execute(&mut *tx)
@@ -110,4 +115,45 @@ pub enum OutboxError {
     Database(#[from] sqlx::Error),
     #[error("NATS operation failed: {0}")]
     Nats(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compatibility_queries_match_the_canonical_migration() {
+        let schema = crate::db::SCHEMA_SQL;
+        let (_, compat_and_rest) = schema
+            .split_once("CREATE TABLE IF NOT EXISTS message_outbox_compat (")
+            .expect("canonical migration must define message_outbox_compat");
+        let (compat_schema, _) = compat_and_rest
+            .split_once("\n);")
+            .expect("compat table definition must terminate");
+        for column in [
+            "message_id",
+            "tenant_id",
+            "subject",
+            "envelope",
+            "attempts",
+            "available_at",
+            "published_at",
+            "last_error",
+            "created_at",
+        ] {
+            assert!(
+                compat_schema.contains(column),
+                "compat schema missing {column}"
+            );
+        }
+        for query in [
+            COMPAT_ENQUEUE_SQL,
+            COMPAT_CLAIM_SQL,
+            COMPAT_MARK_PUBLISHED_SQL,
+            COMPAT_RESCHEDULE_SQL,
+        ] {
+            assert!(query.contains("message_outbox_compat"));
+            assert!(!query.contains("message_outbox "));
+        }
+    }
 }
