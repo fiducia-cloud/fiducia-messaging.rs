@@ -30,7 +30,7 @@ impl Outbox {
         subject: &str,
         envelope: &Envelope<T>,
     ) -> Result<(), OutboxError> {
-        if subject.trim().is_empty() {
+        if !is_publishable_subject(subject) {
             return Err(OutboxError::InvalidSubject);
         }
         let body = envelope.encode()?;
