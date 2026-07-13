@@ -395,6 +395,14 @@ impl<'a> OutboxPublisher<'a> {
                     break;
                 }
             };
+            if let Err(error) = validate_for_publish(&record.subject, bytes.len()) {
+                // Deterministic row defect (malformed/injected subject or an
+                // oversize payload, e.g. staged before this guard existed):
+                // retrying cannot succeed, so park the row for operator
+                // attention instead of burning attempts and blocking the batch.
+                mark_failed(self.pool, record.id, claim_owner, &error.to_string()).await?;
+                continue;
+            }
             match self
                 .publisher
                 .publish(&record.subject, &record.dedup_id, &bytes)
