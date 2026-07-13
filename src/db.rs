@@ -49,7 +49,9 @@ pub async fn apply_schema(pool: &PgPool) -> Result<(), MessagingError> {
 
 /// Insert a staged outbox row using a pool connection. Convenience for callers
 /// with no open transaction; a repeated tenant-scoped business key is ignored
-/// (`ON CONFLICT`), so enqueue is itself idempotent.
+/// (`ON CONFLICT`), so enqueue is itself idempotent. The subject must be a
+/// canonical routing class and the payload within size limits (see
+/// [`validate_for_publish`]).
 ///
 // RECONCILE: this pool-based enqueue runs in its OWN connection, so it is *not*
 // atomic with the caller's domain change — which defeats the whole point of a
@@ -58,6 +60,7 @@ pub async fn apply_schema(pool: &PgPool) -> Result<(), MessagingError> {
 // correct entry point for the outbox pattern. This pool variant is kept for
 // backwards compatibility and one-off/manual enqueues.
 pub async fn enqueue_outbox(pool: &PgPool, rec: &OutboxRecord) -> Result<(), MessagingError> {
+    validate_outbox_record(rec)?;
     sqlx::query(OUTBOX_INSERT_SQL)
         .bind(rec.id)
         .bind(&rec.subject)
