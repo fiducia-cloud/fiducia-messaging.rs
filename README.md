@@ -165,6 +165,16 @@ cargo test --features postgres              # + DB-free schema checks
 cargo run --bin fiducia-relay --features postgres,nats
 ```
 
+The relay's non-secret batch size can be supplied through the pinned, audited
+`flags-2-env` launcher:
+
+```sh
+make -B -C vendor/flags-2-env all
+DATABASE_URL=postgres://... NATS_URL=nats://... scripts/with-flags2env.sh --relay-batch=100 -- cargo run --locked --bin fiducia-relay --features postgres,nats
+```
+
+Connection URLs remain environment-only because they may embed credentials.
+
 ## License
 
 MIT

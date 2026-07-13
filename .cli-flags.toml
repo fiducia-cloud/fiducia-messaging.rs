@@ -1,0 +1,24 @@
+# Non-secret command-line configuration for fiducia-messaging. PostgreSQL and
+# NATS connection URLs remain environment-only because they may embed credentials.
+[help]
+url = "https://github.com/fiducia-cloud/fiducia-messaging.rs"
+columns = ["options", "env", "type", "description"]
+
+[parse]
+allow_unknown = false
+
+[env]
+ignore = ["DATABASE_URL", "NATS_URL"]
+
+[flags.relay-batch]
+env = "RELAY_BATCH"
+aliases = ["relay-batch"]
+short = "b"
+type = "integer"
+help = "Maximum outbox messages claimed per relay iteration."
+
+[flags.log]
+env = "RUST_LOG"
+aliases = ["log"]
+type = "string"
+help = "Rust tracing filter."
