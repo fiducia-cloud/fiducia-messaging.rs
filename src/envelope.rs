@@ -112,8 +112,10 @@ impl<T> MessageEnvelope<T> {
         idempotency_key: impl Into<String>,
     ) -> Self {
         MessageEnvelope {
+            envelope_version: ENVELOPE_VERSION,
             message_id,
             message_type: message_type.into(),
+            source: None,
             schema_version: 1,
             correlation_id: message_id,
             causation_id: None,
