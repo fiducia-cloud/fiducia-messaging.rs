@@ -39,8 +39,12 @@ through.
 `MessageEnvelope<T>` wraps a typed `payload` in identical metadata for every
 message: ids (`message_id`, `correlation_id`, `causation_id`), scope
 (`tenant_id`, `workflow_id`, `execution_id`), authority (`idempotency_key`,
-`fencing_token`), lifecycle (`created_at`, `expires_at`), and tracing
-(`trace_parent`, `schema_version`).
+`fencing_token`), lifecycle (`created_at`, `expires_at`), tracing
+(`trace_parent`), provenance (`source`), and two orthogonal versions:
+`envelope_version` (the wire-format framing, checked against `ENVELOPE_VERSION`)
+and `schema_version` (the typed payload). `envelope.validate()` rejects an
+unknown `envelope_version` or a blank identity; `encode()` / `decode()` are the
+validating serialize/deserialize pair (`to_vec` skips validation).
 
 ```rust
 use fiducia_messaging::MessageEnvelope;
