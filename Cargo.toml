@@ -16,9 +16,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
-thiserror = "1"
+thiserror = "2"
 async-trait = "0.1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # The async `Publisher` trait's runtime + the relay binary's `#[tokio::main]`,
 # and the `#[tokio::test]` harness. No live services are touched by the tests.
@@ -26,7 +26,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 
 # Optional: a real Postgres-backed outbox/inbox repository (the `postgres`
 # feature). Runtime-checked queries only, so no DATABASE_URL is needed at build.
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "postgres",
     "uuid",
