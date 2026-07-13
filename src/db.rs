@@ -86,10 +86,10 @@ pub async fn enqueue_outbox_tx(
     tx: &mut Transaction<'_, Postgres>,
     rec: &OutboxRecord,
 ) -> Result<(), MessagingError> {
-    // Preserve codex's non-empty-subject guard.
-    if rec.subject.trim().is_empty() {
-        return Err(MessagingError::database("outbox subject must be non-empty"));
-    }
+    // Strengthens codex's non-empty-subject guard: the subject must be a
+    // canonical routing class (no wildcards / injected tokens) and the payload
+    // within MAX_MESSAGE_BYTES, so poison rows never enter the outbox.
+    validate_outbox_record(rec)?;
     sqlx::query(OUTBOX_INSERT_SQL)
         .bind(rec.id)
         .bind(&rec.subject)
