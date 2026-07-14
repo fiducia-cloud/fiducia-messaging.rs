@@ -109,7 +109,19 @@ impl OutboxPublisher {
                     .await?;
                 continue;
             }
-            match self.nats.publish(subject, body.into()).await {
+            // Tag the publish with the envelope's message_id as `Nats-Msg-Id` so
+            // a JetStream stream over this subject collapses a crash-window
+            // re-publish (published-but-not-marked) into one stored message — the
+            // same dedup the integrated path gets from `dedup_id`. On a plain
+            // core-NATS subject the header is simply ignored, so this is safe
+            // either way and costs nothing.
+            let mut headers = async_nats::HeaderMap::new();
+            headers.insert("Nats-Msg-Id", message_id.to_string().as_str());
+            match self
+                .nats
+                .publish_with_headers(subject, headers, body.into())
+                .await
+            {
                 Ok(()) => {
                     self.nats
                         .flush()
