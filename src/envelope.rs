@@ -392,6 +392,39 @@ mod tests {
     }
 
     #[test]
+    fn ensure_consumable_enforces_freshness_then_fencing() {
+        let expires = fixed_now();
+        let base = MessageEnvelope::new_at(fixed_now(), fixed_id(), "runner.command", (), "k")
+            .with_expiry(expires);
+        let before = expires - chrono::Duration::seconds(1);
+
+        // Expired -> refused before fencing is even considered.
+        assert!(matches!(
+            base.clone().with_fencing_token(9).ensure_consumable(expires, true),
+            Err(MessagingError::Expired { expired_at }) if expired_at == expires
+        ));
+
+        // Fresh but fencing required and absent -> MissingFencingToken.
+        assert!(matches!(
+            base.ensure_consumable(before, true),
+            Err(MessagingError::MissingFencingToken { .. })
+        ));
+
+        // Fresh + fencing present -> returns the token for Kleppmann fencing.
+        assert_eq!(
+            base.clone().with_fencing_token(9).ensure_consumable(before, true).unwrap(),
+            Some(9)
+        );
+
+        // Fencing not required -> Ok(None) even without a token.
+        assert_eq!(base.ensure_consumable(before, false).unwrap(), None);
+
+        // No expiry set -> never stale.
+        let forever = MessageEnvelope::new_at(fixed_now(), fixed_id(), "note", (), "k");
+        assert_eq!(forever.ensure_consumable(expires, false).unwrap(), None);
+    }
+
+    #[test]
     fn convenience_new_fills_generated_fields() {
         let env = MessageEnvelope::new("x", (), "k");
         // correlation seeded from message_id; not asserting exact values.
