@@ -264,6 +264,16 @@ pub async fn release_outbox_claims(
 /// Try to record an incoming message for consumer dedup. Returns `true` the
 /// first time this `message_id` is seen and `false` for a duplicate delivery, so
 /// the caller runs the external effect at most once.
+///
+// RECONCILE / HAZARD: this pool-based claim commits on its OWN connection, so it
+// is *not* atomic with the effect it guards. If the process crashes after this
+// insert commits but before the effect runs, the redelivery loses the insert
+// (`false`) and the effect is **skipped forever** — at-most-once with silent
+// effect loss (`processed_at` is never consulted here). Prefer the tx-scoped
+// [`crate::inbox::Inbox`] (`PgInbox`): its `begin`/`mark_processed` run inside
+// the consumer's OWN transaction, so the effect and the dedup claim commit or
+// roll back together. Use this pool variant only when the effect is itself
+// idempotent/fenced downstream and effect-loss-on-crash is acceptable.
 pub async fn inbox_try_insert(
     pool: &PgPool,
     message_id: Uuid,
