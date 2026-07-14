@@ -398,6 +398,23 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 7, 12, 0, 0, secs).unwrap()
     }
 
+    #[test]
+    fn min_duplicate_window_covers_claim_ttl_plus_backoff() {
+        // The required broker dedup window is the claim lease plus one capped
+        // backoff defer — the worst-case gap before a re-publish of the same id.
+        assert_eq!(
+            min_duplicate_window(DEFAULT_CLAIM_TTL),
+            DEFAULT_CLAIM_TTL + MAX_PUBLISH_BACKOFF
+        );
+        assert_eq!(
+            min_duplicate_window(Duration::from_secs(30)),
+            Duration::from_secs(30) + MAX_PUBLISH_BACKOFF
+        );
+        // Always strictly larger than the lease alone (a window == claim_ttl
+        // would miss a backoff-deferred re-publish).
+        assert!(min_duplicate_window(DEFAULT_CLAIM_TTL) > DEFAULT_CLAIM_TTL);
+    }
+
     fn id(n: u128) -> Uuid {
         Uuid::from_u128(n)
     }
