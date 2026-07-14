@@ -33,6 +33,32 @@ use crate::subjects::Subject;
 /// backstop.
 pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
 
+/// Default durable claim lease held by the outbox relay while publishing a batch
+/// (`db::OutboxPublisher`). After it expires a crashed worker's rows become
+/// reclaimable, so this also bounds the worst-case crash-to-republish gap the
+/// broker's dedup window must cover — see [`min_duplicate_window`].
+pub const DEFAULT_CLAIM_TTL: Duration = Duration::from_secs(300);
+
+/// The maximum a transient publish failure defers the *next* attempt of a row
+/// (`db::reschedule_publish` caps its backoff at `interval '5 minutes'`). A row
+/// published-but-not-marked can therefore be re-published up to this much later.
+pub const MAX_PUBLISH_BACKOFF: Duration = Duration::from_secs(300);
+
+/// The minimum JetStream stream `duplicate_window` a deployment must configure
+/// for the relay's re-publishes to be collapsed by the broker.
+///
+/// **This crate cannot set it** — a stream's dedup window is broker/stream
+/// configuration, owned by the deployment, not the library. But a window shorter
+/// than the relay's worst-case gap between publishing a message and re-publishing
+/// the same `dedup_id` silently turns a crash-window retry into a *duplicate
+/// delivery*. That gap is bounded by the claim lease (a crashed worker's rows
+/// reclaim after `claim_ttl`) plus one capped backoff defer, so the window must
+/// be at least `claim_ttl + MAX_PUBLISH_BACKOFF`. The per-consumer inbox is the
+/// durable backstop beyond this window; the window keeps the common case off it.
+pub fn min_duplicate_window(claim_ttl: Duration) -> Duration {
+    claim_ttl.saturating_add(MAX_PUBLISH_BACKOFF)
+}
+
 /// Validate that `subject` is a canonical `fiducia.<group>.<event>.v<version>`
 /// routing class and `payload_len` fits [`MAX_MESSAGE_BYTES`]. Shared by the
 /// enqueue path (`db::enqueue_outbox*`) and the drain paths ([`Relay::drain`],
