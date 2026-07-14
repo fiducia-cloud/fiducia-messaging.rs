@@ -227,6 +227,39 @@ impl<T> MessageEnvelope<T> {
     pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
         self.expires_at.is_some_and(|exp| now >= exp)
     }
+
+    /// The single gate a consumer should call **before running the effect a
+    /// message drives**. It bundles the two checks that make effectively-once
+    /// non-optional, so a handler cannot forget one:
+    ///
+    ///   1. **Freshness** — a message handled at or past its `expires_at` is
+    ///      refused (`Expired`), so a replayed/stale envelope cannot re-drive an
+    ///      effect long after it was authorized.
+    ///   2. **Authority** — when `require_fencing` is set (any externally-visible
+    ///      mutation), the envelope must carry a `fencing_token`; otherwise
+    ///      `MissingFencingToken`. The token is returned so the caller can pass it
+    ///      to the resource for Kleppmann fencing (the resource rejects a token
+    ///      lower than the highest it has seen, so a stale holder is stopped).
+    ///
+    /// Returns `Some(token)` when fencing was required, `None` otherwise. Use
+    /// `require_fencing = true` for anything that mutates the outside world and
+    /// `false` for pure notifications/reads.
+    pub fn ensure_consumable(
+        &self,
+        now: DateTime<Utc>,
+        require_fencing: bool,
+    ) -> Result<Option<u64>, MessagingError> {
+        if let Some(expires_at) = self.expires_at {
+            if now >= expires_at {
+                return Err(MessagingError::Expired { expired_at: expires_at });
+            }
+        }
+        if require_fencing {
+            Ok(Some(self.require_fencing_token()?))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 impl<T: Serialize> MessageEnvelope<T> {

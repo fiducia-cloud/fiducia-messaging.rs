@@ -1,2 +1,17 @@
 /target
 **/*.rs.bk
+
+# --- hardened baseline (auto) ---
+.DS_Store
+Thumbs.db
+*.log
+*.swp
+*~
+tmp/
+.direnv/
+.env
+.env.*
+!.env.example
+target/
+*.pdb
+.cargo-target-*/
