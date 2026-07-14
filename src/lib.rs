@@ -87,8 +87,9 @@ pub mod inbox;
 pub use envelope::{MessageEnvelope, ENVELOPE_VERSION};
 pub use error::MessagingError;
 pub use outbox::{
-    tenant_scoped_dedup_id, validate_for_publish, Inbox, InboxRecord, OutboxRecord, OutboxStatus,
-    Relay, RelayOutcome, MAX_MESSAGE_BYTES,
+    min_duplicate_window, tenant_scoped_dedup_id, validate_for_publish, Inbox, InboxRecord,
+    OutboxRecord, OutboxStatus, Relay, RelayOutcome, DEFAULT_CLAIM_TTL, MAX_MESSAGE_BYTES,
+    MAX_PUBLISH_BACKOFF,
 };
 pub use publisher::{PublishedMessage, Publisher, RecordingPublisher};
 pub use subjects::{Subject, SubjectError};
