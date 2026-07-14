@@ -369,6 +369,12 @@ impl<'a> OutboxPublisher<'a> {
     /// Override the durable claim lease. It must cover the expected worst-case
     /// time to publish a whole batch; expired claims are deliberately
     /// reclaimable after a worker crash.
+    ///
+    /// The JetStream stream's `duplicate_window` MUST be at least
+    /// [`min_duplicate_window(claim_ttl)`](crate::outbox::min_duplicate_window):
+    /// a shorter window lets a crash-window re-publish be stored as a *new*
+    /// message and double-delivered. This crate cannot set that window (it is
+    /// broker configuration); the deployment must.
     pub fn with_claim_ttl(mut self, claim_ttl: Duration) -> Self {
         self.claim_ttl = claim_ttl;
         self
