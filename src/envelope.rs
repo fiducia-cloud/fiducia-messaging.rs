@@ -227,6 +227,41 @@ impl<T> MessageEnvelope<T> {
     pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
         self.expires_at.is_some_and(|exp| now >= exp)
     }
+
+    /// The single gate a consumer should call **before running the effect a
+    /// message drives**. It bundles the two checks that make effectively-once
+    /// non-optional, so a handler cannot forget one:
+    ///
+    ///   1. **Freshness** — a message handled at or past its `expires_at` is
+    ///      refused (`Expired`), so a replayed/stale envelope cannot re-drive an
+    ///      effect long after it was authorized.
+    ///   2. **Authority** — when `require_fencing` is set (any externally-visible
+    ///      mutation), the envelope must carry a `fencing_token`; otherwise
+    ///      `MissingFencingToken`. The token is returned so the caller can pass it
+    ///      to the resource for Kleppmann fencing (the resource rejects a token
+    ///      lower than the highest it has seen, so a stale holder is stopped).
+    ///
+    /// Returns `Some(token)` when fencing was required, `None` otherwise. Use
+    /// `require_fencing = true` for anything that mutates the outside world and
+    /// `false` for pure notifications/reads.
+    pub fn ensure_consumable(
+        &self,
+        now: DateTime<Utc>,
+        require_fencing: bool,
+    ) -> Result<Option<u64>, MessagingError> {
+        if let Some(expires_at) = self.expires_at {
+            if now >= expires_at {
+                return Err(MessagingError::Expired {
+                    expired_at: expires_at,
+                });
+            }
+        }
+        if require_fencing {
+            Ok(Some(self.require_fencing_token()?))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 impl<T: Serialize> MessageEnvelope<T> {
@@ -356,6 +391,42 @@ mod tests {
         // No expiry set -> never expires.
         let forever = MessageEnvelope::new_at(fixed_now(), fixed_id(), "t", (), "k");
         assert!(!forever.is_expired(expires + chrono::Duration::days(3650)));
+    }
+
+    #[test]
+    fn ensure_consumable_enforces_freshness_then_fencing() {
+        let expires = fixed_now();
+        let base = MessageEnvelope::new_at(fixed_now(), fixed_id(), "runner.command", (), "k")
+            .with_expiry(expires);
+        let before = expires - chrono::Duration::seconds(1);
+
+        // Expired -> refused before fencing is even considered.
+        assert!(matches!(
+            base.clone().with_fencing_token(9).ensure_consumable(expires, true),
+            Err(MessagingError::Expired { expired_at }) if expired_at == expires
+        ));
+
+        // Fresh but fencing required and absent -> MissingFencingToken.
+        assert!(matches!(
+            base.ensure_consumable(before, true),
+            Err(MessagingError::MissingFencingToken { .. })
+        ));
+
+        // Fresh + fencing present -> returns the token for Kleppmann fencing.
+        assert_eq!(
+            base.clone()
+                .with_fencing_token(9)
+                .ensure_consumable(before, true)
+                .unwrap(),
+            Some(9)
+        );
+
+        // Fencing not required -> Ok(None) even without a token.
+        assert_eq!(base.ensure_consumable(before, false).unwrap(), None);
+
+        // No expiry set -> never stale.
+        let forever = MessageEnvelope::new_at(fixed_now(), fixed_id(), "note", (), "k");
+        assert_eq!(forever.ensure_consumable(expires, false).unwrap(), None);
     }
 
     #[test]

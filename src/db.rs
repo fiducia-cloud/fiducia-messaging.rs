@@ -264,6 +264,16 @@ pub async fn release_outbox_claims(
 /// Try to record an incoming message for consumer dedup. Returns `true` the
 /// first time this `message_id` is seen and `false` for a duplicate delivery, so
 /// the caller runs the external effect at most once.
+///
+// RECONCILE / HAZARD: this pool-based claim commits on its OWN connection, so it
+// is *not* atomic with the effect it guards. If the process crashes after this
+// insert commits but before the effect runs, the redelivery loses the insert
+// (`false`) and the effect is **skipped forever** — at-most-once with silent
+// effect loss (`processed_at` is never consulted here). Prefer the tx-scoped
+// [`crate::inbox::Inbox`] (`PgInbox`): its `begin`/`mark_processed` run inside
+// the consumer's OWN transaction, so the effect and the dedup claim commit or
+// roll back together. Use this pool variant only when the effect is itself
+// idempotent/fenced downstream and effect-loss-on-crash is acceptable.
 pub async fn inbox_try_insert(
     pool: &PgPool,
     message_id: Uuid,
@@ -349,7 +359,7 @@ impl<'a> OutboxPublisher<'a> {
             publisher,
             batch_size: 100,
             max_attempts: 8,
-            claim_ttl: Duration::from_secs(300),
+            claim_ttl: crate::outbox::DEFAULT_CLAIM_TTL,
         }
     }
 
@@ -369,6 +379,12 @@ impl<'a> OutboxPublisher<'a> {
     /// Override the durable claim lease. It must cover the expected worst-case
     /// time to publish a whole batch; expired claims are deliberately
     /// reclaimable after a worker crash.
+    ///
+    /// The JetStream stream's `duplicate_window` MUST be at least
+    /// [`min_duplicate_window(claim_ttl)`](crate::outbox::min_duplicate_window):
+    /// a shorter window lets a crash-window re-publish be stored as a *new*
+    /// message and double-delivered. This crate cannot set that window (it is
+    /// broker configuration); the deployment must.
     pub fn with_claim_ttl(mut self, claim_ttl: Duration) -> Self {
         self.claim_ttl = claim_ttl;
         self

@@ -27,6 +27,16 @@
 //! external effects: the fencing token stops a stale actor from acting, and the
 //! idempotency key stops a duplicate from acting twice.
 //!
+//! A consumer enforces both with one call —
+//! [`ensure_consumable`](envelope::MessageEnvelope::ensure_consumable) — before
+//! running the effect a message drives, so neither check is silently skipped.
+//! The broker side has a matching precondition: the JetStream stream's
+//! `duplicate_window` must be at least
+//! [`min_duplicate_window`](outbox::min_duplicate_window)`(claim_ttl)` or a
+//! relay's crash-window re-publish is stored as a new message and delivered
+//! twice — see that function. This crate cannot set the window; the deployment
+//! must, and the per-consumer inbox is the durable backstop beyond it.
+//!
 //! ## The outbox/inbox pattern
 //!
 //! A Postgres commit and a NATS publish cannot be a single atomic operation. So
@@ -87,8 +97,9 @@ pub mod inbox;
 pub use envelope::{MessageEnvelope, ENVELOPE_VERSION};
 pub use error::MessagingError;
 pub use outbox::{
-    tenant_scoped_dedup_id, validate_for_publish, Inbox, InboxRecord, OutboxRecord, OutboxStatus,
-    Relay, RelayOutcome, MAX_MESSAGE_BYTES,
+    min_duplicate_window, tenant_scoped_dedup_id, validate_for_publish, Inbox, InboxRecord,
+    OutboxRecord, OutboxStatus, Relay, RelayOutcome, DEFAULT_CLAIM_TTL, MAX_MESSAGE_BYTES,
+    MAX_PUBLISH_BACKOFF,
 };
 pub use publisher::{PublishedMessage, Publisher, RecordingPublisher};
 pub use subjects::{Subject, SubjectError};
