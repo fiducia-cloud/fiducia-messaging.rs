@@ -13,7 +13,7 @@
 //! Everything here is pure and deterministic — no clock, no id generation — so
 //! the caller threads in ids/timestamps and the tests assert exact values.
 
-use std::{collections::HashSet, fmt::Write};
+use std::{collections::HashSet, fmt::Write, time::Duration};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
