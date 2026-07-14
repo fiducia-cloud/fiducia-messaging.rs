@@ -349,7 +349,7 @@ impl<'a> OutboxPublisher<'a> {
             publisher,
             batch_size: 100,
             max_attempts: 8,
-            claim_ttl: Duration::from_secs(300),
+            claim_ttl: crate::outbox::DEFAULT_CLAIM_TTL,
         }
     }
 
