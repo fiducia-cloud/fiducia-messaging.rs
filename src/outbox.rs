@@ -621,4 +621,23 @@ mod tests {
         }
         assert_eq!(OutboxStatus::from_str("nonsense"), None);
     }
+
+    #[test]
+    fn dedup_ids_are_fixed_size_stable_and_namespace_separated() {
+        let tenant = id(91);
+        let business_key = "invoice/客户/2026-07/".repeat(200);
+        let tenant_id = tenant_scoped_dedup_id(Some(tenant), &business_key);
+        let tenant_repeat = tenant_scoped_dedup_id(Some(tenant), &business_key);
+        let global_id = tenant_scoped_dedup_id(None, &business_key);
+
+        assert_eq!(tenant_id, tenant_repeat);
+        assert_eq!(tenant_id.len(), 67);
+        assert_eq!(global_id.len(), 67);
+        assert!(tenant_id.starts_with("v1-"));
+        assert_ne!(tenant_id, global_id);
+        assert!(
+            !tenant_id.contains("invoice"),
+            "business keys must not leak"
+        );
+    }
 }
