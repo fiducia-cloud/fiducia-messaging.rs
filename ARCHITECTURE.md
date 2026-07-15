@@ -18,7 +18,10 @@ responsibilities:
 | durable state | **Postgres / CockroachDB** |
 
 `fiducia-messaging` is the thin glue those three share so every service speaks
-the bus the same way. It contributes exactly three things
+the bus the same way. (That is the *intended* role: no service consumes the
+crate yet, and the relay is not yet deployed — see the README's "Adoption
+status" section for the honest current-state snapshot and the adoption path.)
+It contributes exactly three things
 (`src/lib.rs`, `Cargo.toml` description):
 
 1. a standard **message envelope** (`src/envelope.rs`),

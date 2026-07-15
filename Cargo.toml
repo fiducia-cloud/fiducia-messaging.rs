@@ -19,6 +19,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 thiserror = "2"
 async-trait = "0.1"
 sha2 = "0.11"
+# Structured logging facade only (no subscriber, no I/O): a no-op unless the
+# embedding service installs a subscriber. Operator-critical events — a message
+# parked as failed, a batch drain error — must reach the same log pipeline as
+# every other fiducia service instead of raw stderr.
+tracing = "0.1"
 
 # The async `Publisher` trait's runtime + the relay binary's `#[tokio::main]`,
 # and the `#[tokio::test]` harness. No live services are touched by the tests.
@@ -42,12 +47,23 @@ sqlx = { version = "0.9", default-features = false, features = [
 # build must NOT pull this in — the crate builds and tests with no network.
 async-nats = { version = "0.49.1", default-features = false, features = ["jetstream", "ring"], optional = true }
 
+# Optional: the JSON log subscriber for the deployable binaries (relay/compat).
+# Library consumers install their own subscriber; the default offline build
+# stays free of it.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "json",
+    "env-filter",
+    "ansi",
+], optional = true }
+
 [features]
 default = []
 # Postgres-backed outbox/inbox repo + schema apply.
 postgres = ["dep:sqlx"]
-# Real JetStream `Publisher` (`NatsPublisher`).
-nats = ["dep:async-nats"]
+# Real JetStream `Publisher` (`NatsPublisher`) + the JSON log subscriber the
+# relay/compat binaries initialize (a networked deployable needs real logs).
+nats = ["dep:async-nats", "dep:tracing-subscriber"]
 # The original codex-authored direct PostgreSQL/NATS service, preserved verbatim
 # for wire/API backward-compat: `transactional::{Outbox, OutboxPublisher}` over
 # `compat_envelope::Envelope`, plus the `fiducia-messaging-compat` binary.
