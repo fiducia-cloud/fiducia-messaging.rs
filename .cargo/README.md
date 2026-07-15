@@ -1,4 +1,5 @@
-# Cargo policy
+# .cargo
 
-Repository-local Cargo configuration, currently the dependency-audit policy.
-Advisory exceptions must be explicit, justified, and time-bounded.
+Cargo configuration scoped to this crate. `audit.toml` is the `cargo audit`
+advisory policy CI enforces — any accepted/ignored advisory must be recorded
+here with a justification, so the dependency-audit gate stays reviewable.

@@ -152,7 +152,7 @@ impl OutboxPublisher {
         loop {
             timer.tick().await;
             if let Err(error) = self.publish_batch().await {
-                eprintln!("outbox publish batch failed: {error}");
+                tracing::error!(%error, "compat outbox: publish batch failed; retrying on the next interval");
             }
         }
     }

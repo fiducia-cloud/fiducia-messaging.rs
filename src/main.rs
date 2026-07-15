@@ -13,6 +13,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use fiducia_messaging::publisher::NatsPublisher;
     use fiducia_messaging::OutboxPublisher;
 
+    // JSON structured logs, level from RUST_LOG (default info) — the same log
+    // contract as the rest of the fleet, so a parked (dead-lettered) outbox row
+    // or a batch failure is visible to the log pipeline, not lost on raw stderr.
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let db_url = std::env::var("DATABASE_URL")
         .map_err(|_| "DATABASE_URL must be set (e.g. postgres://user:pass@host/db)")?;
     let nats_url =
@@ -36,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // callers that own the DB dance.
     let outbox = OutboxPublisher::new(&pool, &publisher).with_batch_size(batch_size);
 
-    eprintln!("fiducia-relay: draining message_outbox to configured NATS endpoint");
+    tracing::info!("fiducia-relay: draining message_outbox to the configured NATS endpoint");
     outbox.run(Duration::from_millis(500)).await?;
     Ok(())
 }

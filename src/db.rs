@@ -405,10 +405,14 @@ impl<'a> OutboxPublisher<'a> {
             let bytes = match serde_json::to_vec(&record.payload) {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    self.record_failure(&record, claim_owner, &error.to_string())
+                    // A payload that cannot re-serialize is a deterministic row
+                    // defect exactly like a malformed subject: retrying cannot
+                    // succeed. Park it (with the loud dead-letter log below)
+                    // instead of burning all attempts on backoff and stopping
+                    // the whole batch for one poison row.
+                    self.park_failed(&record, claim_owner, &error.to_string())
                         .await?;
-                    release_outbox_claims(self.pool, claim_owner).await?;
-                    break;
+                    continue;
                 }
             };
             if let Err(error) = validate_for_publish(&record.subject, bytes.len()) {
@@ -416,7 +420,8 @@ impl<'a> OutboxPublisher<'a> {
                 // oversize payload, e.g. staged before this guard existed):
                 // retrying cannot succeed, so park the row for operator
                 // attention instead of burning attempts and blocking the batch.
-                mark_failed(self.pool, record.id, claim_owner, &error.to_string()).await?;
+                self.park_failed(&record, claim_owner, &error.to_string())
+                    .await?;
                 continue;
             }
             match self
@@ -448,22 +453,50 @@ impl<'a> OutboxPublisher<'a> {
     ) -> Result<(), MessagingError> {
         let attempts = i32::try_from(record.attempts).unwrap_or(i32::MAX);
         if attempts >= self.max_attempts {
-            mark_failed(self.pool, record.id, claim_owner, error).await?;
+            self.park_failed(record, claim_owner, error).await?;
         } else {
+            tracing::warn!(
+                id = %record.id,
+                subject = %record.subject,
+                attempts = record.attempts,
+                error,
+                "outbox: publish failed; rescheduled with backoff"
+            );
             reschedule_publish(self.pool, record.id, claim_owner, error).await?;
         }
         Ok(())
     }
 
+    /// Park a row as `failed` — the outbox's dead letter. This is the moment a
+    /// durable domain event permanently stops flowing to the bus, so it must be
+    /// loud: without this log line the only trace is a row an operator would
+    /// have to find with `SELECT ... WHERE status = 'failed'`.
+    async fn park_failed(
+        &self,
+        record: &OutboxRecord,
+        claim_owner: Uuid,
+        error: &str,
+    ) -> Result<(), MessagingError> {
+        tracing::error!(
+            id = %record.id,
+            subject = %record.subject,
+            attempts = record.attempts,
+            error,
+            "outbox: message parked as failed (dead-lettered); it will NOT be \
+             retried — inspect message_outbox WHERE status = 'failed'"
+        );
+        mark_failed(self.pool, record.id, claim_owner, error).await?;
+        Ok(())
+    }
+
     /// Drain forever on a fixed interval. A batch failure is logged and the loop
-    /// continues (folded from codex's `run`, using `eprintln!` to keep the crate
-    /// free of a tracing dependency).
+    /// continues.
     pub async fn run(self, interval: Duration) -> Result<(), MessagingError> {
         let mut timer = tokio::time::interval(interval);
         loop {
             timer.tick().await;
             if let Err(error) = self.publish_batch().await {
-                eprintln!("fiducia outbox publish batch failed: {error}");
+                tracing::error!(%error, "outbox: publish batch failed; retrying on the next interval");
             }
         }
     }
@@ -484,7 +517,13 @@ fn row_to_outbox(row: &sqlx::postgres::PgRow) -> Result<OutboxRecord, MessagingE
         created_at: row
             .try_get("created_at")
             .map_err(MessagingError::database)?,
-        status: OutboxStatus::from_str(&status_str).unwrap_or(OutboxStatus::Pending),
+        status: OutboxStatus::from_str(&status_str).unwrap_or_else(|| {
+            // An unrecognized status can only mean out-of-band schema drift or a
+            // manual edit; treating it as Pending re-enters the row into the
+            // drain loop, which is the safe direction — but never silently.
+            tracing::warn!(status = %status_str, "outbox: unknown row status; treating as pending");
+            OutboxStatus::Pending
+        }),
         attempts: attempts.max(0) as u32,
     })
 }
