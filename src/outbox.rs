@@ -522,6 +522,46 @@ mod tests {
         assert!(publisher.is_empty());
     }
 
+    /// One poison row must not sink its batch: an oversize payload in the
+    /// MIDDLE of a batch fails alone — reported under its own id with a
+    /// non-empty error — while the valid rows on BOTH sides of it still
+    /// publish, in order. (The injected-subject test pins the same
+    /// keep-draining rule with the poison rows at the head; this pins the
+    /// resume-after-failure half for the size limit.)
+    #[tokio::test]
+    async fn oversize_row_mid_batch_fails_alone_and_both_neighbors_publish() {
+        let publisher = RecordingPublisher::new();
+        let relay = Relay::new(&publisher);
+        let mut poison = rec(2, "d-2");
+        poison.payload = serde_json::json!({ "blob": "x".repeat(MAX_MESSAGE_BYTES) });
+        let batch = vec![rec(1, "d-1"), poison, rec(3, "d-3")];
+
+        let outcome = relay.drain(&batch).await;
+
+        assert_eq!(
+            outcome.published,
+            vec![id(1), id(3)],
+            "both valid neighbors publish"
+        );
+        assert_eq!(outcome.failed_count(), 1);
+        assert_eq!(
+            outcome.failed[0].0,
+            id(2),
+            "failed under the poison row's id"
+        );
+        assert!(
+            !outcome.failed[0].1.is_empty(),
+            "the failure must carry an error message"
+        );
+        assert!(outcome.failed[0].1.contains("limit is"));
+
+        // Exactly the two valid rows reached the bus, in batch order.
+        assert_eq!(publisher.len(), 2);
+        let published = publisher.published();
+        assert_eq!(published[0].dedup_id, tenant_scoped_dedup_id(None, "d-1"));
+        assert_eq!(published[1].dedup_id, tenant_scoped_dedup_id(None, "d-3"));
+    }
+
     #[tokio::test]
     async fn relay_records_publisher_failure_without_crashing() {
         struct FailingPublisher;
@@ -639,5 +679,58 @@ mod tests {
             !tenant_id.contains("invoice"),
             "business keys must not leak"
         );
+    }
+
+    /// The parts of the dedup-id contract the other tests leave open: the
+    /// exact documented shape is `v1-` + 64 lowercase hex characters; the
+    /// global (None-tenant) scope is deterministic too; near-miss key pairs
+    /// (prefixes, embedded separators — guarded by the length prefix) never
+    /// collide; and the global id differs from EVERY tenant-scoped id for the
+    /// same key, with tenant ids pairwise distinct.
+    #[test]
+    fn dedup_id_is_v1_plus_64_hex_and_separates_near_keys_and_all_scopes() {
+        let global = tenant_scoped_dedup_id(None, "orders/42");
+        assert_eq!(
+            global,
+            tenant_scoped_dedup_id(None, "orders/42"),
+            "global scope must be deterministic across calls"
+        );
+        let hex = global.strip_prefix("v1-").expect("documented v1- prefix");
+        assert_eq!(hex.len(), 64, "SHA-256 digest is 64 hex chars");
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "digest must be lowercase hex: {global}"
+        );
+
+        // Near-miss keys must never collide, in either scope.
+        let tenant = id(90);
+        for (a, b) in [
+            ("a", "ab"),
+            ("ab", "a\u{0}b"),
+            ("orders/42", "orders/421"),
+            ("orders/42", "orders/42 "),
+        ] {
+            assert_ne!(
+                tenant_scoped_dedup_id(None, a),
+                tenant_scoped_dedup_id(None, b),
+                "global ids for {a:?} and {b:?} must differ"
+            );
+            assert_ne!(
+                tenant_scoped_dedup_id(Some(tenant), a),
+                tenant_scoped_dedup_id(Some(tenant), b),
+                "tenant ids for {a:?} and {b:?} must differ"
+            );
+        }
+
+        // The global id shares a key with 32 tenants and collides with none of
+        // them; the tenant-scoped ids are also pairwise distinct.
+        let mut seen = HashSet::new();
+        seen.insert(global.clone());
+        for n in 1..=32u128 {
+            let scoped = tenant_scoped_dedup_id(Some(id(n)), "orders/42");
+            assert_ne!(scoped, global, "tenant {n} must not collide with global");
+            assert!(seen.insert(scoped), "tenant {n} collided with another id");
+        }
     }
 }
