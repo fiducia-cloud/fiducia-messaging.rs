@@ -154,6 +154,14 @@ impl Subject {
             .strip_prefix('v')
             .and_then(|v| v.parse::<u32>().ok())
             .ok_or_else(|| SubjectError::Malformed(subject.to_string()))?;
+        // Canonical spelling only: `u32::parse` also accepts "v01"/"v+1", which
+        // render back as "v1" — accepting them would split one routing class
+        // into aliases that exact-match and `*.v1`-wildcard subscribers never
+        // receive. A subject that does not round-trip byte-for-byte is not a
+        // fiducia subject.
+        if parts[3] != format!("v{version}") {
+            return Err(SubjectError::Malformed(subject.to_string()));
+        }
         Subject::new(parts[1], parts[2], version)
     }
 }
@@ -264,6 +272,28 @@ mod tests {
             Subject::parse("fiducia.reviews.findings.x1"),
             Err(SubjectError::Malformed(_))
         ));
+    }
+
+    /// `u32::parse` alone would accept alias spellings of a version. Any
+    /// subject that does not round-trip byte-for-byte must be rejected, or one
+    /// routing class silently forks into variants no subscriber receives.
+    #[test]
+    fn parse_rejects_noncanonical_version_spellings() {
+        for alias in [
+            "fiducia.reviews.findings.v01",
+            "fiducia.reviews.findings.v+1",
+            "fiducia.reviews.findings.v0x1",
+            "fiducia.reviews.findings.v 1",
+        ] {
+            assert!(
+                matches!(Subject::parse(alias), Err(SubjectError::Malformed(_))),
+                "accepted non-canonical subject {alias:?}"
+            );
+        }
+        // Multi-digit canonical versions still parse.
+        let v10 = Subject::parse("fiducia.reviews.findings.v10").unwrap();
+        assert_eq!(v10.version(), 10);
+        assert_eq!(v10.as_string(), "fiducia.reviews.findings.v10");
     }
 
     #[test]

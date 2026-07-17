@@ -40,6 +40,8 @@ pub const SCHEMA_SQL: &str = include_str!("../migrations/0001_fiducia_messaging.
 /// Forward migration adding tenant-scoped idempotency and durable claim leases.
 pub const HARDENING_SCHEMA_SQL: &str =
     include_str!("../migrations/0002_tenant_dedup_and_claim_leases.sql");
+/// Forward migration adding the retention indexes behind the `purge_*` helpers.
+pub const RETENTION_SCHEMA_SQL: &str = include_str!("../migrations/0003_retention_indexes.sql");
 
 /// Apply the messaging schema. Idempotent (`CREATE TABLE IF NOT EXISTS`), so it
 /// is safe to call on every process start.
@@ -48,6 +50,9 @@ pub async fn apply_schema(pool: &DatabaseConnection) -> Result<(), MessagingErro
         .await
         .map_err(MessagingError::database)?;
     pool.execute_unprepared(HARDENING_SCHEMA_SQL)
+        .await
+        .map_err(MessagingError::database)?;
+    pool.execute_unprepared(RETENTION_SCHEMA_SQL)
         .await
         .map_err(MessagingError::database)?;
     Ok(())
@@ -172,6 +177,17 @@ impl ClaimedOutboxRow {
     }
 }
 
+/// Convert a positive, finite duration to whole milliseconds for SQL interval
+/// arithmetic, rejecting zero/overflow so a misconfigured knob fails loudly
+/// instead of producing an instantly-expiring lease or an everything-qualifies
+/// purge cutoff.
+fn positive_ms(duration: Duration, what: &str) -> Result<i64, MessagingError> {
+    i64::try_from(duration.as_millis())
+        .ok()
+        .filter(|millis| *millis > 0)
+        .ok_or_else(|| MessagingError::database(format!("{what} must be positive and finite")))
+}
+
 /// Atomically lease up to `limit` due rows to `claim_owner` and commit that
 /// ownership before returning. Other workers skip an active claim; after
 /// `claim_ttl` it becomes reclaimable if this worker crashed.
@@ -188,10 +204,7 @@ pub async fn claim_pending_outbox(
             "outbox claim limit must be positive",
         ));
     }
-    let claim_ttl_ms = i64::try_from(claim_ttl.as_millis())
-        .ok()
-        .filter(|millis| *millis > 0)
-        .ok_or_else(|| MessagingError::database("outbox claim TTL must be positive and finite"))?;
+    let claim_ttl_ms = positive_ms(claim_ttl, "outbox claim TTL")?;
     let rows = ClaimedOutboxRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         CLAIM_PENDING_SQL,
@@ -289,25 +302,40 @@ pub async fn reschedule_publish(
     Ok(result.rows_affected() == 1)
 }
 
+// Raw SQL (like the claim CTE it undoes): the attempt decrement is column
+// arithmetic the entity API can't express as a plain `Set`.
+const RELEASE_CLAIMS_SQL: &str = "UPDATE message_outbox
+        SET claim_owner = NULL,
+            claim_expires_at = NULL,
+            attempts = greatest(attempts - 1, 0)
+      WHERE status = 'pending' AND claim_owner = $1";
+
 /// Release every still-pending row owned by a batch claim. Used when a relay
 /// stops a batch after the first broker failure so untouched rows are
 /// immediately available to other workers rather than waiting for lease expiry.
+///
+/// Releasing also undoes the claim-time attempt increment: a released row was
+/// leased but never offered to the broker (the batch stopped before reaching
+/// it). Without the decrement, a broker outage inflates `attempts` across the
+/// whole claimable window once per drain tick — rows then hit `max_attempts`
+/// and are parked as `failed` on their FIRST real publish attempt. Rows this
+/// claim already resolved (published/rescheduled/parked) had their
+/// `claim_owner` cleared, so only untouched rows match here. A crashed worker's
+/// rows skip this path (lease expiry) and keep their increment — that is the
+/// rare case, and counting it is the safe direction.
 pub async fn release_outbox_claims(
     pool: &DatabaseConnection,
     claim_owner: Uuid,
 ) -> Result<u64, MessagingError> {
-    let result = message_outbox::Entity::update_many()
-        .set(message_outbox::ActiveModel {
-            claim_owner: Set(None),
-            claim_expires_at: Set(None),
-            ..Default::default()
-        })
-        .filter(message_outbox::Column::Status.eq("pending"))
-        .filter(message_outbox::Column::ClaimOwner.eq(claim_owner))
-        .exec(pool)
+    let result = pool
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            RELEASE_CLAIMS_SQL,
+            [claim_owner.into()],
+        ))
         .await
         .map_err(MessagingError::database)?;
-    Ok(result.rows_affected)
+    Ok(result.rows_affected())
 }
 
 /// Try to record an incoming message for consumer dedup. Returns `true` the
@@ -362,7 +390,7 @@ pub async fn inbox_mark_processed(
     message_id: Uuid,
     at: DateTime<Utc>,
 ) -> Result<(), MessagingError> {
-    message_inbox::Entity::update_many()
+    let result = message_inbox::Entity::update_many()
         .set(message_inbox::ActiveModel {
             processed_at: Set(Some(at)),
             ..Default::default()
@@ -371,7 +399,80 @@ pub async fn inbox_mark_processed(
         .exec(pool)
         .await
         .map_err(MessagingError::database)?;
+    if result.rows_affected == 0 {
+        // Nothing matched: the effect ran without a recorded claim (or against
+        // the wrong id), i.e. the at-most-once bookkeeping is broken at the call
+        // site. The update itself stays a no-op, but never a silent one.
+        tracing::warn!(%message_id, "inbox: mark_processed matched no row; was inbox_try_insert called for this id?");
+    }
     Ok(())
+}
+
+// Time-bounded purges of terminal rows. Raw SQL: the age cutoff is interval
+// arithmetic (`now() - $1 ms`) against a partial-index predicate, and keeping
+// the exact SQL in a const lets the tests pin the safety property (only
+// terminal rows ever match).
+const PURGE_PUBLISHED_OUTBOX_SQL: &str = "DELETE FROM message_outbox
+      WHERE status = 'published'
+        AND published_at IS NOT NULL
+        AND published_at < now() - ($1 * interval '1 millisecond')";
+const PURGE_PROCESSED_INBOX_SQL: &str = "DELETE FROM message_inbox
+      WHERE processed_at IS NOT NULL
+        AND processed_at < now() - ($1 * interval '1 millisecond')";
+const PURGE_PROCESSED_CONSUMER_INBOX_SQL: &str = "DELETE FROM message_inbox_consumer
+      WHERE processed_at IS NOT NULL
+        AND processed_at < now() - ($1 * interval '1 millisecond')";
+
+async fn purge(
+    pool: &DatabaseConnection,
+    sql: &'static str,
+    older_than: Duration,
+) -> Result<u64, MessagingError> {
+    let cutoff_ms = positive_ms(older_than, "retention age")?;
+    let result = pool
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            sql,
+            [cutoff_ms.into()],
+        ))
+        .await
+        .map_err(MessagingError::database)?;
+    Ok(result.rows_affected())
+}
+
+/// Delete `published` outbox rows older than `older_than`, returning how many
+/// were removed. Only terminal rows qualify — `pending` rows (however old) and
+/// parked `failed` rows are never touched: the former are undelivered work, the
+/// latter are the dead-letter queue an operator still needs to inspect.
+///
+/// `older_than` must comfortably exceed the JetStream stream's
+/// `duplicate_window`; the row's `dedup_id` is the audit trail for what was
+/// published inside it.
+pub async fn purge_published_outbox(
+    pool: &DatabaseConnection,
+    older_than: Duration,
+) -> Result<u64, MessagingError> {
+    purge(pool, PURGE_PUBLISHED_OUTBOX_SQL, older_than).await
+}
+
+/// Delete processed `message_inbox` rows older than `older_than`. Unprocessed
+/// claims are kept: deleting one would let a redelivery re-run its effect.
+/// Keep the cutoff far beyond the transport's redelivery horizon — a purged
+/// claim no longer dedups a very-late replay of the same message.
+pub async fn purge_processed_inbox(
+    pool: &DatabaseConnection,
+    older_than: Duration,
+) -> Result<u64, MessagingError> {
+    purge(pool, PURGE_PROCESSED_INBOX_SQL, older_than).await
+}
+
+/// Delete processed `message_inbox_consumer` claims older than `older_than`,
+/// with the same caveats as [`purge_processed_inbox`].
+pub async fn purge_processed_consumer_inbox(
+    pool: &DatabaseConnection,
+    older_than: Duration,
+) -> Result<u64, MessagingError> {
+    purge(pool, PURGE_PROCESSED_CONSUMER_INBOX_SQL, older_than).await
 }
 
 /// A DB-coupled outbox drainer. It atomically commits an expiring owner lease on
@@ -541,13 +642,40 @@ impl<'a> OutboxPublisher<'a> {
     }
 
     /// Drain forever on a fixed interval. A batch failure is logged and the loop
-    /// continues.
+    /// continues. Prefer [`run_until`](Self::run_until) in deployables so a
+    /// SIGTERM drains cleanly instead of stranding claims.
     pub async fn run(self, interval: Duration) -> Result<(), MessagingError> {
+        self.run_until(interval, std::future::pending::<()>()).await
+    }
+
+    /// Drain on a fixed interval until `shutdown` resolves, then return.
+    ///
+    /// The in-flight batch always completes first (the shutdown race happens
+    /// only between batches), so every leased row is marked or released before
+    /// exit. Without this, a rolling restart kills the relay mid-batch and the
+    /// claimed rows sit unpublishable until the claim TTL (minutes) expires —
+    /// on every single deploy.
+    pub async fn run_until(
+        self,
+        interval: Duration,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> Result<(), MessagingError> {
         let mut timer = tokio::time::interval(interval);
+        // A slow batch must not be chased by a burst of make-up ticks.
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tokio::pin!(shutdown);
         loop {
-            timer.tick().await;
-            if let Err(error) = self.publish_batch().await {
-                tracing::error!(%error, "outbox: publish batch failed; retrying on the next interval");
+            tokio::select! {
+                biased; // a pending shutdown wins over a due tick
+                _ = &mut shutdown => {
+                    tracing::info!("outbox: shutdown signal received; stopping after the drained batch");
+                    return Ok(());
+                }
+                _ = timer.tick() => {
+                    if let Err(error) = self.publish_batch().await {
+                        tracing::error!(%error, "outbox: publish batch failed; retrying on the next interval");
+                    }
+                }
             }
         }
     }
@@ -577,5 +705,48 @@ mod tests {
         assert!(HARDENING_SCHEMA_SQL.contains("message_inbox_tenant_idempotency_uq"));
         assert!(CLAIM_PENDING_SQL.contains("claim_expires_at <= now()"));
         assert!(CLAIM_PENDING_SQL.contains("claim_owner = $2"));
+    }
+
+    // The claim increments attempts up front; release must undo it for rows the
+    // batch never reached, or a broker outage marches the whole claimable
+    // window to max_attempts without a single real publish attempt.
+    #[test]
+    fn release_undoes_the_claim_attempt_increment() {
+        assert!(CLAIM_PENDING_SQL.contains("attempts = outbox.attempts + 1"));
+        assert!(RELEASE_CLAIMS_SQL.contains("attempts = greatest(attempts - 1, 0)"));
+        assert!(RELEASE_CLAIMS_SQL.contains("status = 'pending' AND claim_owner = $1"));
+    }
+
+    // Purges may only ever remove terminal rows: published outbox rows and
+    // processed inbox claims. Pending work and the failed dead-letter queue
+    // must never match, and every purge must be time-bounded.
+    #[test]
+    fn purges_target_only_terminal_rows_and_are_time_bounded() {
+        assert!(PURGE_PUBLISHED_OUTBOX_SQL.contains("status = 'published'"));
+        assert!(PURGE_PUBLISHED_OUTBOX_SQL.contains("published_at IS NOT NULL"));
+        assert!(!PURGE_PUBLISHED_OUTBOX_SQL.contains("failed"));
+        for sql in [PURGE_PROCESSED_INBOX_SQL, PURGE_PROCESSED_CONSUMER_INBOX_SQL] {
+            assert!(sql.contains("processed_at IS NOT NULL"));
+        }
+        for sql in [
+            PURGE_PUBLISHED_OUTBOX_SQL,
+            PURGE_PROCESSED_INBOX_SQL,
+            PURGE_PROCESSED_CONSUMER_INBOX_SQL,
+        ] {
+            assert!(sql.trim_start().starts_with("DELETE FROM"));
+            assert!(sql.contains("now() - ($1 * interval '1 millisecond')"));
+        }
+        assert!(RETENTION_SCHEMA_SQL.contains("message_outbox_published_retention_idx"));
+        assert!(RETENTION_SCHEMA_SQL.contains("message_inbox_retention_idx"));
+    }
+
+    #[test]
+    fn positive_ms_rejects_zero_and_overflow() {
+        assert_eq!(positive_ms(Duration::from_millis(1500), "x").unwrap(), 1500);
+        assert!(positive_ms(Duration::ZERO, "x").is_err());
+        // sub-millisecond truncates to 0 -> rejected, not an instant lease
+        assert!(positive_ms(Duration::from_micros(900), "x").is_err());
+        // u128 millis beyond i64 -> rejected, not a wrapped negative interval
+        assert!(positive_ms(Duration::from_secs(u64::MAX), "x").is_err());
     }
 }

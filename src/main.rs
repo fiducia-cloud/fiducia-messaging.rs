@@ -51,8 +51,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // callers that own the DB dance.
     let outbox = OutboxPublisher::new(&pool, &publisher).with_batch_size(batch_size);
 
+    // Opt-in retention: RELAY_RETENTION_HOURS purges published outbox rows and
+    // processed inbox claims older than that age, hourly. Off by default —
+    // deleting a processed inbox claim gives up dedup for a very-late replay of
+    // that message, so the operator picks the horizon.
+    if let Some(retention_hours) = std::env::var("RELAY_RETENTION_HOURS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|hours| *hours > 0)
+    {
+        fn log_purge(table: &str, result: Result<u64, fiducia_messaging::MessagingError>) {
+            match result {
+                Ok(0) => {}
+                Ok(rows) => tracing::info!(table, rows, "retention: purged terminal rows"),
+                Err(error) => tracing::warn!(table, %error, "retention: purge failed"),
+            }
+        }
+        let retention = Duration::from_secs(retention_hours * 3600);
+        let purge_pool = pool.clone();
+        tracing::info!(retention_hours, "fiducia-relay: hourly retention purge enabled");
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(3600));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                timer.tick().await;
+                use fiducia_messaging::db;
+                log_purge(
+                    "message_outbox",
+                    db::purge_published_outbox(&purge_pool, retention).await,
+                );
+                log_purge(
+                    "message_inbox",
+                    db::purge_processed_inbox(&purge_pool, retention).await,
+                );
+                log_purge(
+                    "message_inbox_consumer",
+                    db::purge_processed_consumer_inbox(&purge_pool, retention).await,
+                );
+            }
+        });
+    }
+
+    // Drain until SIGTERM/SIGINT, finishing the in-flight batch so its claimed
+    // rows are marked or released — otherwise every rolling restart strands a
+    // batch until the claim TTL expires.
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    };
+
     tracing::info!("fiducia-relay: draining message_outbox to the configured NATS endpoint");
-    outbox.run(Duration::from_millis(500)).await?;
+    outbox.run_until(Duration::from_millis(500), shutdown).await?;
+    tracing::info!("fiducia-relay: stopped cleanly");
     Ok(())
 }
 

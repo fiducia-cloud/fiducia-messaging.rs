@@ -27,7 +27,8 @@ tracing = "0.1"
 
 # The async `Publisher` trait's runtime + the relay binary's `#[tokio::main]`,
 # and the `#[tokio::test]` harness. No live services are touched by the tests.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+# `signal` powers the relay's graceful SIGTERM/SIGINT drain (run_until).
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 
 # Optional: a real Postgres-backed outbox/inbox repository (the `postgres`
 # feature). SeaORM is the house database layer: entity-API queries where the
