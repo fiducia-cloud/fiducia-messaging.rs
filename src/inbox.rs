@@ -91,7 +91,7 @@ impl Inbox {
         consumer: &str,
         message_id: Uuid,
     ) -> Result<(), InboxError> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE message_inbox_consumer
                 SET processed_at = now()
               WHERE consumer = $1 AND message_id = $2",
@@ -100,6 +100,17 @@ impl Inbox {
         .bind(message_id)
         .execute(&mut **tx)
         .await?;
+        if result.rows_affected() == 0 {
+            // No claim row in this transaction means begin() was skipped or a
+            // different consumer/message_id was passed — the at-most-once
+            // bookkeeping is broken at the call site. Stay a no-op (the effect
+            // already ran), but never a silent one.
+            tracing::warn!(
+                consumer,
+                %message_id,
+                "inbox: mark_processed matched no claim row; was begin() called in this transaction?"
+            );
+        }
         Ok(())
     }
 }
