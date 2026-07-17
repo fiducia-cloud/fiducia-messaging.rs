@@ -32,7 +32,7 @@ It contributes exactly three things
 It implements **no queueing, persistence, or routing of its own** — JetStream
 does that. The crate's default build (`cargo test --locked`) pulls in no NATS
 client and no database driver and runs entirely in-memory; `async-nats` and
-`sqlx` are optional dependencies gated behind the `nats` and `postgres`
+`sea-orm` are optional dependencies gated behind the `nats` and `postgres`
 features (`Cargo.toml`). There is one small deployable, the `fiducia-relay`
 binary (`src/main.rs`), which is nothing more than a drain loop from the
 outbox table to JetStream — "the library is the product", as its module doc
@@ -68,7 +68,7 @@ idempotency key stops a *duplicate* from acting twice.
 | `src/outbox.rs` | always | The pure core of the outbox/inbox pattern: `OutboxRecord`, `OutboxStatus`, `tenant_scoped_dedup_id`, `validate_for_publish` (subject + 1 MiB size guard), the transport-agnostic `Relay`, `RelayOutcome`, the in-memory `Inbox` guard, and `InboxRecord`. Fully deterministic — no clock or id generation inside. |
 | `src/publisher.rs` | always (NATS impl behind `nats`) | The `Publisher` trait — the seam to JetStream. `RecordingPublisher` (in-memory, test double that mirrors JetStream publish dedup) and `NatsPublisher` (real JetStream context; sets `Nats-Msg-Id`, awaits the publish ack). |
 | `src/error.rs` | always | The single `MessagingError` enum: `MissingFencingToken`, `Expired`, `UnsupportedEnvelopeVersion`, `MissingIdentity`, `InvalidSubject`, `PayloadTooLarge`, `Serialize`, `Transport(String)`, `Database(String)`. Transport/DB variants are strings so the default build carries no client crates. |
-| `src/db.rs` | `postgres` | The sqlx-backed durable side: `apply_schema` (embeds `migrations/` via `SCHEMA_SQL` / `HARDENING_SCHEMA_SQL`), `enqueue_outbox` / `enqueue_outbox_tx`, leased `claim_pending_outbox`, owner-conditioned `mark_published` / `mark_failed` / `reschedule_publish` / `release_outbox_claims`, the scoped inbox helpers, and the DB-coupled `OutboxPublisher` drainer. Runtime-checked queries only — no `DATABASE_URL` at build time. |
+| `src/db.rs` | `postgres` | The SeaORM-backed durable side: `apply_schema` (embeds `migrations/` via `SCHEMA_SQL` / `HARDENING_SCHEMA_SQL`), `enqueue_outbox` / `enqueue_outbox_tx`, leased `claim_pending_outbox`, owner-conditioned `mark_published` / `mark_failed` / `reschedule_publish` / `release_outbox_claims`, the scoped inbox helpers, and the DB-coupled `OutboxPublisher` drainer. Runtime-checked queries only — no `DATABASE_URL` at build time. |
 | `src/inbox.rs` | `postgres` | `PgInbox` (module-local name `Inbox`) — the **per-consumer** Postgres inbox over `message_inbox_consumer`; `begin(tx, consumer, envelope)` → `InboxDecision::{Process, Duplicate}`, `mark_processed`. |
 | `src/compat_envelope.rs` | always | The original, pre-merge `Envelope<T>` wire shape, preserved verbatim so peers speaking the old format still decode. Pure serde. |
 | `src/transactional.rs` | `compat-service` | The original direct PostgreSQL/NATS service (`CompatOutbox` / `CompatOutboxPublisher`) over the compat envelope and its own `message_outbox_compat` table. |
@@ -172,10 +172,10 @@ the *domain transaction*, and the tables in `migrations/` are exactly that
 pattern and nothing more.
 
 Migrations are forward-only, idempotent (`CREATE ... IF NOT EXISTS`), and
-dual-use: run by `sqlx::migrate!("./migrations")` in the binaries, or applied
-directly via `db::apply_schema` which embeds the same files as
+dual-use: applied declaratively out-of-band by the deployment's migration
+tooling, or directly via `db::apply_schema` which embeds the same files as
 `db::SCHEMA_SQL` / `db::HARDENING_SCHEMA_SQL` (`src/db.rs`). Migration 0002 is
-deliberately a separate file because sqlx records migration checksums —
+deliberately a separate file because migration runners record checksums —
 editing an applied migration would strand deployments
 (`migrations/0002_tenant_dedup_and_claim_leases.sql` header comment).
 
@@ -436,14 +436,15 @@ tx.commit().await?;                             // claim + effect atomically
    rows become claimable after lease expiry (`src/db.rs`).
 7. **Publish is acked before the row is marked published**
    (`NatsPublisher::publish` awaits the JetStream ack, `src/publisher.rs`).
-8. **The default build is offline and deterministic.** No NATS, no sqlx, no
+8. **The default build is offline and deterministic.** No NATS, no database
+   driver, no
    network; the pure core takes clocks and ids as parameters so tests assert
    exact values (`Cargo.toml`, `src/outbox.rs`).
 9. **All SQL is parameterized; connection URLs are never logged**
    (README "Security / hardening"; verified across `src/db.rs`,
    `src/transactional.rs`).
 10. **Migrations are forward-only** — 0002 amends 0001 rather than editing it,
-    because sqlx checksums applied migrations
+    because migration runners checksum applied migrations
     (`migrations/0002_tenant_dedup_and_claim_leases.sql`).
 
 ## 9. Operational notes
@@ -451,8 +452,8 @@ tx.commit().await?;                             // claim + effect atomically
 ### Binaries and deployment
 
 - **`fiducia-relay`** (`src/main.rs`; requires `--features postgres,nats`) —
-  the only production deployable. On boot: connect Postgres, run
-  `sqlx::migrate!("./migrations")`, connect NATS, wrap the JetStream context
+  the only production deployable. On boot: connect Postgres (schema is
+  applied declaratively out-of-band), connect NATS, wrap the JetStream context
   in `NatsPublisher`, then `OutboxPublisher::run(500ms)` forever. The
   `Dockerfile` builds exactly this binary (pinned `rust:1.97.0-slim-bookworm`
   by digest, `--locked --release`, stripped) into a digest-pinned distroless
@@ -479,11 +480,11 @@ CI (`.github/workflows/cli-flags.yml`).
 
 ### Migrations
 
-Run automatically by both binaries on boot, or apply manually:
-`db::apply_schema(&pool)` executes the embedded files; everything is
-idempotent so re-running on every process start is safe. Library consumers
-that manage their own migration set can vendor the `migrations/` directory
-into their own `sqlx::migrate!` chain.
+Applied declaratively out-of-band by the deployment's migration tooling
+(never by the binaries on boot), or manually: `db::apply_schema(&pool)`
+executes the embedded files; everything is idempotent so re-running is safe.
+Library consumers that manage their own migration set can vendor the
+`migrations/` directory into their own migration chain.
 
 ### Testing and CI
 

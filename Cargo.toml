@@ -2,7 +2,7 @@
 # standard message envelope, the transactional outbox/inbox pattern, and the
 # subject taxonomy. It is NOT a broker: JetStream delivers, fiducia-node stays
 # the authority, Postgres holds state. The default build requires no external
-# services and no network (async-nats and sqlx are optional).
+# services and no network (async-nats and sea-orm are optional).
 [package]
 name = "fiducia-messaging"
 version = "0.1.0"
@@ -30,17 +30,18 @@ tracing = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 # Optional: a real Postgres-backed outbox/inbox repository (the `postgres`
-# feature). Runtime-checked queries only, so no DATABASE_URL is needed at build.
-sqlx = { version = "0.9", default-features = false, features = [
-    "runtime-tokio",
-    "postgres",
-    "uuid",
-    "chrono",
-    "json",
-    # `migrate` + `macros` power the `migrations/` dir: the `sqlx::migrate!`
-    # macro in the relay binary embeds and runs the tracked migrations.
-    "migrate",
+# feature). SeaORM is the house database layer: entity-API queries where the
+# query is expressible, `sea_orm::Statement` for the SKIP LOCKED / backoff SQL.
+# Runtime-checked either way, so no DATABASE_URL is needed at build. Schema in
+# `migrations/` is applied declaratively (dpm) or via `db::apply_schema` — not
+# by a boot-time migrator.
+sea-orm = { version = "1", default-features = false, features = [
     "macros",
+    "runtime-tokio-rustls",
+    "sqlx-postgres",
+    "with-chrono",
+    "with-json",
+    "with-uuid",
 ], optional = true }
 
 # Optional: a real NATS JetStream publisher (the `nats` feature). The default
@@ -60,7 +61,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 [features]
 default = []
 # Postgres-backed outbox/inbox repo + schema apply.
-postgres = ["dep:sqlx"]
+postgres = ["dep:sea-orm"]
 # Real JetStream `Publisher` (`NatsPublisher`) + the JSON log subscriber the
 # relay/compat binaries initialize (a networked deployable needs real logs).
 nats = ["dep:async-nats", "dep:tracing-subscriber"]

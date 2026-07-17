@@ -33,9 +33,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(100);
 
-    let pool = sqlx::PgPool::connect(&db_url).await?;
-    // Adopt the migrations dir: apply every tracked migration in `migrations/`.
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    let mut options = sea_orm::ConnectOptions::new(db_url);
+    options.sqlx_logging(false);
+    let pool = sea_orm::Database::connect(options).await?;
+    // Schema is applied declaratively out-of-band (the tracked files in
+    // `migrations/` are the source of truth) — no boot-time migrator here.
+    // A caller that owns its own database can still run
+    // `fiducia_messaging::db::apply_schema` explicitly.
 
     let client = async_nats::connect(&nats_url).await?;
     let js = async_nats::jetstream::new(client);

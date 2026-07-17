@@ -66,7 +66,7 @@ pub enum MessagingError {
     Transport(String),
 
     /// A Postgres operation failed (only reachable under the `postgres`
-    /// feature). Kept as a string so the default build carries no sqlx.
+    /// feature). Kept as a string so the default build carries no SeaORM.
     #[error("database error: {0}")]
     Database(String),
 }

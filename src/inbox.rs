@@ -20,16 +20,21 @@
 // `message_inbox_consumer`, since MINE already owns the `message_inbox` name for
 // the message-id-keyed variant.
 
+use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::{
+    ActiveValue::Set, ColumnTrait, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait,
+    QueryFilter,
+};
 use serde::Serialize;
-use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
+use crate::entity::message_inbox_consumer;
 use crate::envelope::MessageEnvelope;
 
 /// A Postgres-backed, per-consumer idempotent inbox.
 #[derive(Clone)]
 pub struct Inbox {
-    pool: PgPool,
+    pool: DatabaseConnection,
 }
 
 /// Whether a consumer should run the effect for a message, or skip it as a
@@ -43,14 +48,14 @@ pub enum InboxDecision {
 }
 
 impl Inbox {
-    /// Build an inbox over a pool.
-    pub fn new(pool: PgPool) -> Self {
+    /// Build an inbox over a SeaORM connection (itself a pooled handle).
+    pub fn new(pool: DatabaseConnection) -> Self {
         Self { pool }
     }
 
-    /// The underlying pool (e.g. to open the transaction the caller threads into
-    /// [`begin`](Self::begin)).
-    pub fn pool(&self) -> &PgPool {
+    /// The underlying connection (e.g. to open the transaction the caller
+    /// threads into [`begin`](Self::begin)).
+    pub fn pool(&self) -> &DatabaseConnection {
         &self.pool
     }
 
@@ -60,24 +65,26 @@ impl Inbox {
     /// [`MessageEnvelope::tenant_id`] are read.
     pub async fn begin<T: Serialize>(
         &self,
-        tx: &mut Transaction<'_, Postgres>,
+        tx: &DatabaseTransaction,
         consumer: &str,
         envelope: &MessageEnvelope<T>,
     ) -> Result<InboxDecision, InboxError> {
         if consumer.trim().is_empty() {
             return Err(InboxError::InvalidConsumer);
         }
-        let inserted = sqlx::query(
-            "INSERT INTO message_inbox_consumer (consumer, message_id, tenant_id)
-             VALUES ($1, $2, $3)
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(consumer)
-        .bind(envelope.message_id)
-        .bind(envelope.tenant_id)
-        .execute(&mut **tx)
-        .await?;
-        Ok(if inserted.rows_affected() == 1 {
+        // `ON CONFLICT DO NOTHING` + rows-affected, exactly as before; the
+        // DB-defaulted `received_at` stays `NotSet` so Postgres stamps it.
+        let inserted =
+            message_inbox_consumer::Entity::insert(message_inbox_consumer::ActiveModel {
+                consumer: Set(consumer.to_owned()),
+                message_id: Set(envelope.message_id),
+                tenant_id: Set(envelope.tenant_id),
+                ..Default::default()
+            })
+            .on_conflict(OnConflict::new().do_nothing().to_owned())
+            .exec_without_returning(tx)
+            .await?;
+        Ok(if inserted == 1 {
             InboxDecision::Process
         } else {
             InboxDecision::Duplicate
@@ -87,19 +94,19 @@ impl Inbox {
     /// Stamp the claim processed, in the same transaction as the side effect.
     pub async fn mark_processed(
         &self,
-        tx: &mut Transaction<'_, Postgres>,
+        tx: &DatabaseTransaction,
         consumer: &str,
         message_id: Uuid,
     ) -> Result<(), InboxError> {
-        sqlx::query(
-            "UPDATE message_inbox_consumer
-                SET processed_at = now()
-              WHERE consumer = $1 AND message_id = $2",
-        )
-        .bind(consumer)
-        .bind(message_id)
-        .execute(&mut **tx)
-        .await?;
+        message_inbox_consumer::Entity::update_many()
+            .col_expr(
+                message_inbox_consumer::Column::ProcessedAt,
+                Expr::current_timestamp().into(),
+            )
+            .filter(message_inbox_consumer::Column::Consumer.eq(consumer))
+            .filter(message_inbox_consumer::Column::MessageId.eq(message_id))
+            .exec(tx)
+            .await?;
         Ok(())
     }
 }
@@ -112,5 +119,5 @@ pub enum InboxError {
     InvalidConsumer,
     /// A Postgres operation failed.
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbErr),
 }

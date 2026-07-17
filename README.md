@@ -190,7 +190,7 @@ Both are **off by default**; the crate builds and tests with neither.
 
 | feature | adds |
 | --- | --- |
-| `postgres` | `db` module — sqlx-backed outbox/inbox repo (`apply_schema`, `enqueue_outbox`, `enqueue_outbox_tx`, leased `claim_pending_outbox`, owner-conditioned marks, scoped inbox, …) plus `OutboxPublisher`; and the `inbox` module — the per-consumer `PgInbox`. Runtime-checked queries, so no `DATABASE_URL` at build. Forward-only schema files live in [`migrations/`](migrations/) and are embedded as `db::SCHEMA_SQL` / `db::HARDENING_SCHEMA_SQL`; run the directory with `sqlx::migrate!` or use `db::apply_schema`. |
+| `postgres` | `db` module — SeaORM-backed outbox/inbox repo (`apply_schema`, `enqueue_outbox`, `enqueue_outbox_tx`, leased `claim_pending_outbox`, owner-conditioned marks, scoped inbox, …) plus `OutboxPublisher`; the `entity` module (SeaORM entities for the three tables); and the `inbox` module — the per-consumer `PgInbox`. Entity-API queries where expressible, `sea_orm::Statement` for the SKIP LOCKED / backoff SQL — runtime-checked either way, so no `DATABASE_URL` at build. Forward-only schema files live in [`migrations/`](migrations/) and are embedded as `db::SCHEMA_SQL` / `db::HARDENING_SCHEMA_SQL`; apply them declaratively out-of-band or via `db::apply_schema`. |
 | `nats` | `NatsPublisher` — a real JetStream `Publisher` that sets `Nats-Msg-Id` for publish dedup. |
 
 The `fiducia-relay` binary (a thin outbox→JetStream drain loop) is built with
