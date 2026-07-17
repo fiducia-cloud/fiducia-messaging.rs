@@ -98,7 +98,7 @@ impl Inbox {
         consumer: &str,
         message_id: Uuid,
     ) -> Result<(), InboxError> {
-        message_inbox_consumer::Entity::update_many()
+        let result = message_inbox_consumer::Entity::update_many()
             .col_expr(
                 message_inbox_consumer::Column::ProcessedAt,
                 Expr::current_timestamp().into(),
@@ -107,6 +107,17 @@ impl Inbox {
             .filter(message_inbox_consumer::Column::MessageId.eq(message_id))
             .exec(tx)
             .await?;
+        if result.rows_affected == 0 {
+            // No claim row in this transaction means begin() was skipped or a
+            // different consumer/message_id was passed — the at-most-once
+            // bookkeeping is broken at the call site. Stay a no-op (the effect
+            // already ran), but never a silent one.
+            tracing::warn!(
+                consumer,
+                %message_id,
+                "inbox: mark_processed matched no claim row; was begin() called in this transaction?"
+            );
+        }
         Ok(())
     }
 }
