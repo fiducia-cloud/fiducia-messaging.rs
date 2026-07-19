@@ -251,7 +251,9 @@ impl<T> MessageEnvelope<T> {
     ) -> Result<Option<u64>, MessagingError> {
         if let Some(expires_at) = self.expires_at {
             if now >= expires_at {
-                return Err(MessagingError::Expired { expired_at: expires_at });
+                return Err(MessagingError::Expired {
+                    expired_at: expires_at,
+                });
             }
         }
         if require_fencing {
@@ -412,7 +414,10 @@ mod tests {
 
         // Fresh + fencing present -> returns the token for Kleppmann fencing.
         assert_eq!(
-            base.clone().with_fencing_token(9).ensure_consumable(before, true).unwrap(),
+            base.clone()
+                .with_fencing_token(9)
+                .ensure_consumable(before, true)
+                .unwrap(),
             Some(9)
         );
 
@@ -444,6 +449,33 @@ mod tests {
         let back: MessageEnvelope<()> = MessageEnvelope::decode(&bytes).expect("decode");
         assert_eq!(env, back);
         assert_eq!(back.source.as_deref(), Some("fiducia-node"));
+    }
+
+    /// Forward compatibility: a NEWER producer may add envelope fields this
+    /// build doesn't know. Decoding must tolerate them (same `envelope_version`
+    /// = same framing) with identity, tenant-scoped idempotency, and fencing
+    /// intact — the property that lets producers and consumers upgrade
+    /// independently on a shared bus. (Version *bumps* still reject, below.)
+    #[test]
+    fn decode_tolerates_unknown_fields_from_a_newer_producer() {
+        let env = MessageEnvelope::new_at(fixed_now(), fixed_id(), "claim.created", (), "idem-42")
+            .with_source("fiducia-node")
+            .with_fencing_token(7);
+        let mut value: serde_json::Value = serde_json::to_value(&env).expect("to json");
+        value["a_future_field"] = serde_json::json!({ "added_by": "v1.7-producer" });
+        value["another_hint"] = serde_json::json!(true);
+        let bytes = serde_json::to_vec(&value).expect("bytes");
+
+        let back: MessageEnvelope<()> =
+            MessageEnvelope::decode(&bytes).expect("unknown fields must not break decode");
+        assert_eq!(back.message_id, env.message_id);
+        assert_eq!(back.idempotency_key, "idem-42");
+        assert_eq!(back.tenant_id, env.tenant_id);
+        assert_eq!(
+            back.require_fencing_token().expect("fencing preserved"),
+            7,
+            "authority survives fields we don't understand"
+        );
     }
 
     #[test]

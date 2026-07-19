@@ -1,18 +1,26 @@
 //! Postgres-backed outbox/inbox repository — the `postgres` feature.
 //!
-//! Runtime-checked queries only (`sqlx::query`, not the `query!` macros), so the
-//! crate builds with no `DATABASE_URL` and no live database. The schema lives in
-//! `migrations/` and is embedded via [`SCHEMA_SQL`] / [`HARDENING_SCHEMA_SQL`];
-//! apply it on boot with [`apply_schema`] (or run the whole migrations directory
-//! with `sqlx::migrate!`). These functions are the durable counterparts to the
-//! pure logic in [`crate::outbox`].
+//! SeaORM throughout, per the fleet convention: the entity API
+//! ([`crate::entity`]) for every query it can express, and raw SQL strictly via
+//! [`sea_orm::Statement`] + [`FromQueryResult`] for the two it cannot (the
+//! SKIP LOCKED claim CTE and the SQL-side exponential backoff). Runtime-checked
+//! either way, so the crate builds with no `DATABASE_URL` and no live database.
+//! The schema lives in `migrations/` and is embedded via [`SCHEMA_SQL`] /
+//! [`HARDENING_SCHEMA_SQL`]; deployments apply it declaratively, or a caller
+//! may run [`apply_schema`] explicitly. These functions are the durable
+//! counterparts to the pure logic in [`crate::outbox`].
 
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sea_orm::sea_query::OnConflict;
+use sea_orm::{
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
+    DbBackend, EntityTrait, FromQueryResult, QueryFilter, Statement,
+};
 use uuid::Uuid;
 
+use crate::entity::{message_inbox, message_outbox};
 use crate::error::MessagingError;
 use crate::outbox::{validate_for_publish, OutboxRecord, OutboxStatus};
 use crate::publisher::Publisher;
@@ -26,24 +34,54 @@ fn validate_outbox_record(rec: &OutboxRecord) -> Result<(), MessagingError> {
 }
 
 /// The messaging schema DDL, embedded from the first migration. Idempotent, so
-/// [`apply_schema`] can run it directly and `sqlx::migrate!` can run the same
-/// file as a tracked migration.
+/// [`apply_schema`] can run it directly and a declarative migrator can apply
+/// the same file as a tracked migration.
 pub const SCHEMA_SQL: &str = include_str!("../migrations/0001_fiducia_messaging.sql");
 /// Forward migration adding tenant-scoped idempotency and durable claim leases.
 pub const HARDENING_SCHEMA_SQL: &str =
     include_str!("../migrations/0002_tenant_dedup_and_claim_leases.sql");
+/// Forward migration adding the retention indexes behind the `purge_*` helpers.
+pub const RETENTION_SCHEMA_SQL: &str = include_str!("../migrations/0003_retention_indexes.sql");
 
 /// Apply the messaging schema. Idempotent (`CREATE TABLE IF NOT EXISTS`), so it
 /// is safe to call on every process start.
-pub async fn apply_schema(pool: &PgPool) -> Result<(), MessagingError> {
-    sqlx::raw_sql(SCHEMA_SQL)
-        .execute(pool)
+pub async fn apply_schema(pool: &DatabaseConnection) -> Result<(), MessagingError> {
+    pool.execute_unprepared(SCHEMA_SQL)
         .await
         .map_err(MessagingError::database)?;
-    sqlx::raw_sql(HARDENING_SCHEMA_SQL)
-        .execute(pool)
+    pool.execute_unprepared(HARDENING_SCHEMA_SQL)
         .await
         .map_err(MessagingError::database)?;
+    pool.execute_unprepared(RETENTION_SCHEMA_SQL)
+        .await
+        .map_err(MessagingError::database)?;
+    Ok(())
+}
+
+/// The shared staged-row insert: `ON CONFLICT DO NOTHING` on the tenant-scoped
+/// business key, lease/backoff columns left `NotSet` so their Postgres defaults
+/// apply — the exact column list the sqlx version bound.
+async fn insert_outbox_row<C: ConnectionTrait>(
+    conn: &C,
+    rec: &OutboxRecord,
+) -> Result<(), MessagingError> {
+    validate_outbox_record(rec)?;
+    message_outbox::Entity::insert(message_outbox::ActiveModel {
+        id: Set(rec.id),
+        subject: Set(rec.subject.clone()),
+        tenant_id: Set(rec.tenant_id),
+        idempotency_key: Set(rec.idempotency_key.clone()),
+        dedup_id: Set(rec.dedup_id.clone()),
+        payload: Set(rec.payload.clone()),
+        status: Set(rec.status.as_str().to_owned()),
+        attempts: Set(rec.attempts as i32),
+        created_at: Set(rec.created_at),
+        ..Default::default()
+    })
+    .on_conflict(OnConflict::new().do_nothing().to_owned())
+    .exec_without_returning(conn)
+    .await
+    .map_err(MessagingError::database)?;
     Ok(())
 }
 
@@ -55,26 +93,15 @@ pub async fn apply_schema(pool: &PgPool) -> Result<(), MessagingError> {
 ///
 // RECONCILE: this pool-based enqueue runs in its OWN connection, so it is *not*
 // atomic with the caller's domain change — which defeats the whole point of a
-// transactional outbox. Codex's `Outbox::enqueue` took a `&mut Transaction`;
-// that behaviour is preserved as [`enqueue_outbox_tx`] below, which is the
-// correct entry point for the outbox pattern. This pool variant is kept for
-// backwards compatibility and one-off/manual enqueues.
-pub async fn enqueue_outbox(pool: &PgPool, rec: &OutboxRecord) -> Result<(), MessagingError> {
-    validate_outbox_record(rec)?;
-    sqlx::query(OUTBOX_INSERT_SQL)
-        .bind(rec.id)
-        .bind(&rec.subject)
-        .bind(rec.tenant_id)
-        .bind(&rec.idempotency_key)
-        .bind(&rec.dedup_id)
-        .bind(&rec.payload)
-        .bind(rec.status.as_str())
-        .bind(rec.attempts as i32)
-        .bind(rec.created_at)
-        .execute(pool)
-        .await
-        .map_err(MessagingError::database)?;
-    Ok(())
+// transactional outbox. Codex's `Outbox::enqueue` took a transaction; that
+// behaviour is preserved as [`enqueue_outbox_tx`] below, which is the correct
+// entry point for the outbox pattern. This pool variant is kept for backwards
+// compatibility and one-off/manual enqueues.
+pub async fn enqueue_outbox(
+    pool: &DatabaseConnection,
+    rec: &OutboxRecord,
+) -> Result<(), MessagingError> {
+    insert_outbox_row(pool, rec).await
 }
 
 /// Insert a staged outbox row **inside the caller's transaction** — the correct
@@ -83,33 +110,14 @@ pub async fn enqueue_outbox(pool: &PgPool, rec: &OutboxRecord) -> Result<(), Mes
 /// never lost nor sent for a rolled-back change. A repeated tenant-scoped
 /// business key is ignored (`ON CONFLICT`), keeping enqueue idempotent.
 pub async fn enqueue_outbox_tx(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &DatabaseTransaction,
     rec: &OutboxRecord,
 ) -> Result<(), MessagingError> {
     // Strengthens codex's non-empty-subject guard: the subject must be a
     // canonical routing class (no wildcards / injected tokens) and the payload
     // within MAX_MESSAGE_BYTES, so poison rows never enter the outbox.
-    validate_outbox_record(rec)?;
-    sqlx::query(OUTBOX_INSERT_SQL)
-        .bind(rec.id)
-        .bind(&rec.subject)
-        .bind(rec.tenant_id)
-        .bind(&rec.idempotency_key)
-        .bind(&rec.dedup_id)
-        .bind(&rec.payload)
-        .bind(rec.status.as_str())
-        .bind(rec.attempts as i32)
-        .bind(rec.created_at)
-        .execute(&mut **tx)
-        .await
-        .map_err(MessagingError::database)?;
-    Ok(())
+    insert_outbox_row(tx, rec).await
 }
-
-const OUTBOX_INSERT_SQL: &str = "INSERT INTO message_outbox
-        (id, subject, tenant_id, idempotency_key, dedup_id, payload, status, attempts, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-     ON CONFLICT DO NOTHING";
 
 const CLAIM_PENDING_SQL: &str = "WITH candidates AS (
         SELECT id
@@ -131,13 +139,62 @@ const CLAIM_PENDING_SQL: &str = "WITH candidates AS (
               outbox.idempotency_key, outbox.dedup_id, outbox.payload,
               outbox.status, outbox.attempts, outbox.created_at";
 
+/// The claim CTE's `RETURNING` shape — raw SQL because the entity API cannot
+/// express `FOR UPDATE SKIP LOCKED` inside an updating CTE.
+#[derive(FromQueryResult)]
+struct ClaimedOutboxRow {
+    id: Uuid,
+    subject: String,
+    tenant_id: Option<Uuid>,
+    idempotency_key: String,
+    dedup_id: String,
+    payload: serde_json::Value,
+    status: String,
+    attempts: i32,
+    created_at: DateTime<Utc>,
+}
+
+impl ClaimedOutboxRow {
+    fn into_record(self) -> OutboxRecord {
+        OutboxRecord {
+            id: self.id,
+            subject: self.subject,
+            tenant_id: self.tenant_id,
+            idempotency_key: self.idempotency_key,
+            dedup_id: self.dedup_id,
+            payload: self.payload,
+            created_at: self.created_at,
+            status: OutboxStatus::from_str(&self.status).unwrap_or_else(|| {
+                // An unrecognized status can only mean out-of-band schema drift
+                // or a manual edit; treating it as Pending re-enters the row
+                // into the drain loop, which is the safe direction — but never
+                // silently.
+                tracing::warn!(status = %self.status, "outbox: unknown row status; treating as pending");
+                OutboxStatus::Pending
+            }),
+            attempts: self.attempts.max(0) as u32,
+        }
+    }
+}
+
+/// Convert a positive, finite duration to whole milliseconds for SQL interval
+/// arithmetic, rejecting zero/overflow so a misconfigured knob fails loudly
+/// instead of producing an instantly-expiring lease or an everything-qualifies
+/// purge cutoff.
+fn positive_ms(duration: Duration, what: &str) -> Result<i64, MessagingError> {
+    i64::try_from(duration.as_millis())
+        .ok()
+        .filter(|millis| *millis > 0)
+        .ok_or_else(|| MessagingError::database(format!("{what} must be positive and finite")))
+}
+
 /// Atomically lease up to `limit` due rows to `claim_owner` and commit that
 /// ownership before returning. Other workers skip an active claim; after
 /// `claim_ttl` it becomes reclaimable if this worker crashed.
 ///
 /// The returned records have already had their attempt count incremented.
 pub async fn claim_pending_outbox(
-    pool: &PgPool,
+    pool: &DatabaseConnection,
     claim_owner: Uuid,
     claim_ttl: Duration,
     limit: i64,
@@ -147,22 +204,20 @@ pub async fn claim_pending_outbox(
             "outbox claim limit must be positive",
         ));
     }
-    let claim_ttl_ms = i64::try_from(claim_ttl.as_millis())
-        .ok()
-        .filter(|millis| *millis > 0)
-        .ok_or_else(|| MessagingError::database("outbox claim TTL must be positive and finite"))?;
-    let rows = sqlx::query(CLAIM_PENDING_SQL)
-        .bind(limit)
-        .bind(claim_owner)
-        .bind(claim_ttl_ms)
-        .fetch_all(pool)
-        .await
-        .map_err(MessagingError::database)?;
+    let claim_ttl_ms = positive_ms(claim_ttl, "outbox claim TTL")?;
+    let rows = ClaimedOutboxRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        CLAIM_PENDING_SQL,
+        [limit.into(), claim_owner.into(), claim_ttl_ms.into()],
+    ))
+    .all(pool)
+    .await
+    .map_err(MessagingError::database)?;
 
     let mut records = rows
-        .iter()
-        .map(row_to_outbox)
-        .collect::<Result<Vec<_>, _>>()?;
+        .into_iter()
+        .map(ClaimedOutboxRow::into_record)
+        .collect::<Vec<_>>();
     records.sort_by_key(|record| record.created_at);
     Ok(records)
 }
@@ -170,94 +225,116 @@ pub async fn claim_pending_outbox(
 /// Mark a row published only if `claim_owner` still owns it. Returns `false`
 /// when the lease expired and another worker reclaimed the row.
 pub async fn mark_published(
-    pool: &PgPool,
+    pool: &DatabaseConnection,
     id: Uuid,
     claim_owner: Uuid,
     at: DateTime<Utc>,
 ) -> Result<bool, MessagingError> {
-    let result = sqlx::query(
-        "UPDATE message_outbox
-            SET status = 'published', published_at = $3,
-                last_error = NULL, claim_owner = NULL, claim_expires_at = NULL
-          WHERE id = $1 AND claim_owner = $2",
-    )
-    .bind(id)
-    .bind(claim_owner)
-    .bind(at)
-    .execute(pool)
-    .await
-    .map_err(MessagingError::database)?;
-    Ok(result.rows_affected() == 1)
+    let result = message_outbox::Entity::update_many()
+        .set(message_outbox::ActiveModel {
+            status: Set("published".to_owned()),
+            published_at: Set(Some(at)),
+            last_error: Set(None),
+            claim_owner: Set(None),
+            claim_expires_at: Set(None),
+            ..Default::default()
+        })
+        .filter(message_outbox::Column::Id.eq(id))
+        .filter(message_outbox::Column::ClaimOwner.eq(claim_owner))
+        .exec(pool)
+        .await
+        .map_err(MessagingError::database)?;
+    Ok(result.rows_affected == 1)
 }
 
 /// Mark an owned row failed (retries exhausted). Returns `false` if ownership
 /// has already moved to another relay.
 pub async fn mark_failed(
-    pool: &PgPool,
+    pool: &DatabaseConnection,
     id: Uuid,
     claim_owner: Uuid,
     error: &str,
 ) -> Result<bool, MessagingError> {
-    let result = sqlx::query(
-        "UPDATE message_outbox
-            SET status = 'failed', last_error = $3,
-                claim_owner = NULL, claim_expires_at = NULL
-          WHERE id = $1 AND claim_owner = $2",
-    )
-    .bind(id)
-    .bind(claim_owner)
-    .bind(error)
-    .execute(pool)
-    .await
-    .map_err(MessagingError::database)?;
-    Ok(result.rows_affected() == 1)
+    let result = message_outbox::Entity::update_many()
+        .set(message_outbox::ActiveModel {
+            status: Set("failed".to_owned()),
+            last_error: Set(Some(error.to_owned())),
+            claim_owner: Set(None),
+            claim_expires_at: Set(None),
+            ..Default::default()
+        })
+        .filter(message_outbox::Column::Id.eq(id))
+        .filter(message_outbox::Column::ClaimOwner.eq(claim_owner))
+        .exec(pool)
+        .await
+        .map_err(MessagingError::database)?;
+    Ok(result.rows_affected == 1)
 }
 
 /// Release one owned claim after a transient publish failure, record the error,
 /// and defer the next attempt with exponential backoff. Returns `false` if the
 /// row was already reclaimed by another owner.
+///
+/// Raw SQL: the backoff arithmetic (`interval` math + `power`) has no entity
+/// API expression.
 pub async fn reschedule_publish(
-    pool: &PgPool,
+    pool: &DatabaseConnection,
     id: Uuid,
     claim_owner: Uuid,
     error: &str,
 ) -> Result<bool, MessagingError> {
-    let result = sqlx::query(
-        "UPDATE message_outbox
-            SET last_error = $3,
-                available_at = now()
-                    + least(interval '5 minutes',
-                            interval '1 second'
-                                * power(2, least(greatest(attempts - 1, 0), 8))),
-                claim_owner = NULL,
-                claim_expires_at = NULL
-          WHERE id = $1 AND claim_owner = $2 AND status = 'pending'",
-    )
-    .bind(id)
-    .bind(claim_owner)
-    .bind(error)
-    .execute(pool)
-    .await
-    .map_err(MessagingError::database)?;
+    let result = pool
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE message_outbox
+                SET last_error = $3,
+                    available_at = now()
+                        + least(interval '5 minutes',
+                                interval '1 second'
+                                    * power(2, least(greatest(attempts - 1, 0), 8))),
+                    claim_owner = NULL,
+                    claim_expires_at = NULL
+              WHERE id = $1 AND claim_owner = $2 AND status = 'pending'",
+            [id.into(), claim_owner.into(), error.into()],
+        ))
+        .await
+        .map_err(MessagingError::database)?;
     Ok(result.rows_affected() == 1)
 }
+
+// Raw SQL (like the claim CTE it undoes): the attempt decrement is column
+// arithmetic the entity API can't express as a plain `Set`.
+const RELEASE_CLAIMS_SQL: &str = "UPDATE message_outbox
+        SET claim_owner = NULL,
+            claim_expires_at = NULL,
+            attempts = greatest(attempts - 1, 0)
+      WHERE status = 'pending' AND claim_owner = $1";
 
 /// Release every still-pending row owned by a batch claim. Used when a relay
 /// stops a batch after the first broker failure so untouched rows are
 /// immediately available to other workers rather than waiting for lease expiry.
+///
+/// Releasing also undoes the claim-time attempt increment: a released row was
+/// leased but never offered to the broker (the batch stopped before reaching
+/// it). Without the decrement, a broker outage inflates `attempts` across the
+/// whole claimable window once per drain tick — rows then hit `max_attempts`
+/// and are parked as `failed` on their FIRST real publish attempt. Rows this
+/// claim already resolved (published/rescheduled/parked) had their
+/// `claim_owner` cleared, so only untouched rows match here. A crashed worker's
+/// rows skip this path (lease expiry) and keep their increment — that is the
+/// rare case, and counting it is the safe direction.
 pub async fn release_outbox_claims(
-    pool: &PgPool,
+    pool: &DatabaseConnection,
     claim_owner: Uuid,
 ) -> Result<u64, MessagingError> {
-    let result = sqlx::query(
-        "UPDATE message_outbox
-            SET claim_owner = NULL, claim_expires_at = NULL
-          WHERE status = 'pending' AND claim_owner = $1",
-    )
-    .bind(claim_owner)
-    .execute(pool)
-    .await
-    .map_err(MessagingError::database)?;
+    let result = pool
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            RELEASE_CLAIMS_SQL,
+            [claim_owner.into()],
+        ))
+        .await
+        .map_err(MessagingError::database)?;
     Ok(result.rows_affected())
 }
 
@@ -275,7 +352,7 @@ pub async fn release_outbox_claims(
 // roll back together. Use this pool variant only when the effect is itself
 // idempotent/fenced downstream and effect-loss-on-crash is acceptable.
 pub async fn inbox_try_insert(
-    pool: &PgPool,
+    pool: &DatabaseConnection,
     message_id: Uuid,
     idempotency_key: &str,
     received_at: DateTime<Utc>,
@@ -287,40 +364,115 @@ pub async fn inbox_try_insert(
 /// consumed independently in different tenants, while remaining unique inside
 /// each tenant (or inside the explicit global `None` namespace).
 pub async fn inbox_try_insert_scoped(
-    pool: &PgPool,
+    pool: &DatabaseConnection,
     tenant_id: Option<Uuid>,
     message_id: Uuid,
     idempotency_key: &str,
     received_at: DateTime<Utc>,
 ) -> Result<bool, MessagingError> {
-    let result = sqlx::query(
-        "INSERT INTO message_inbox (message_id, tenant_id, idempotency_key, received_at)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(message_id)
-    .bind(tenant_id)
-    .bind(idempotency_key)
-    .bind(received_at)
-    .execute(pool)
+    let inserted = message_inbox::Entity::insert(message_inbox::ActiveModel {
+        message_id: Set(message_id),
+        tenant_id: Set(tenant_id),
+        idempotency_key: Set(idempotency_key.to_owned()),
+        received_at: Set(received_at),
+        ..Default::default()
+    })
+    .on_conflict(OnConflict::new().do_nothing().to_owned())
+    .exec_without_returning(pool)
     .await
     .map_err(MessagingError::database)?;
-    Ok(result.rows_affected() == 1)
+    Ok(inserted == 1)
 }
 
 /// Mark an inbox row processed once its effect completes.
 pub async fn inbox_mark_processed(
-    pool: &PgPool,
+    pool: &DatabaseConnection,
     message_id: Uuid,
     at: DateTime<Utc>,
 ) -> Result<(), MessagingError> {
-    sqlx::query("UPDATE message_inbox SET processed_at = $2 WHERE message_id = $1")
-        .bind(message_id)
-        .bind(at)
-        .execute(pool)
+    let result = message_inbox::Entity::update_many()
+        .set(message_inbox::ActiveModel {
+            processed_at: Set(Some(at)),
+            ..Default::default()
+        })
+        .filter(message_inbox::Column::MessageId.eq(message_id))
+        .exec(pool)
         .await
         .map_err(MessagingError::database)?;
+    if result.rows_affected == 0 {
+        // Nothing matched: the effect ran without a recorded claim (or against
+        // the wrong id), i.e. the at-most-once bookkeeping is broken at the call
+        // site. The update itself stays a no-op, but never a silent one.
+        tracing::warn!(%message_id, "inbox: mark_processed matched no row; was inbox_try_insert called for this id?");
+    }
     Ok(())
+}
+
+// Time-bounded purges of terminal rows. Raw SQL: the age cutoff is interval
+// arithmetic (`now() - $1 ms`) against a partial-index predicate, and keeping
+// the exact SQL in a const lets the tests pin the safety property (only
+// terminal rows ever match).
+const PURGE_PUBLISHED_OUTBOX_SQL: &str = "DELETE FROM message_outbox
+      WHERE status = 'published'
+        AND published_at IS NOT NULL
+        AND published_at < now() - ($1 * interval '1 millisecond')";
+const PURGE_PROCESSED_INBOX_SQL: &str = "DELETE FROM message_inbox
+      WHERE processed_at IS NOT NULL
+        AND processed_at < now() - ($1 * interval '1 millisecond')";
+const PURGE_PROCESSED_CONSUMER_INBOX_SQL: &str = "DELETE FROM message_inbox_consumer
+      WHERE processed_at IS NOT NULL
+        AND processed_at < now() - ($1 * interval '1 millisecond')";
+
+async fn purge(
+    pool: &DatabaseConnection,
+    sql: &'static str,
+    older_than: Duration,
+) -> Result<u64, MessagingError> {
+    let cutoff_ms = positive_ms(older_than, "retention age")?;
+    let result = pool
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            sql,
+            [cutoff_ms.into()],
+        ))
+        .await
+        .map_err(MessagingError::database)?;
+    Ok(result.rows_affected())
+}
+
+/// Delete `published` outbox rows older than `older_than`, returning how many
+/// were removed. Only terminal rows qualify — `pending` rows (however old) and
+/// parked `failed` rows are never touched: the former are undelivered work, the
+/// latter are the dead-letter queue an operator still needs to inspect.
+///
+/// `older_than` must comfortably exceed the JetStream stream's
+/// `duplicate_window`; the row's `dedup_id` is the audit trail for what was
+/// published inside it.
+pub async fn purge_published_outbox(
+    pool: &DatabaseConnection,
+    older_than: Duration,
+) -> Result<u64, MessagingError> {
+    purge(pool, PURGE_PUBLISHED_OUTBOX_SQL, older_than).await
+}
+
+/// Delete processed `message_inbox` rows older than `older_than`. Unprocessed
+/// claims are kept: deleting one would let a redelivery re-run its effect.
+/// Keep the cutoff far beyond the transport's redelivery horizon — a purged
+/// claim no longer dedups a very-late replay of the same message.
+pub async fn purge_processed_inbox(
+    pool: &DatabaseConnection,
+    older_than: Duration,
+) -> Result<u64, MessagingError> {
+    purge(pool, PURGE_PROCESSED_INBOX_SQL, older_than).await
+}
+
+/// Delete processed `message_inbox_consumer` claims older than `older_than`,
+/// with the same caveats as [`purge_processed_inbox`].
+pub async fn purge_processed_consumer_inbox(
+    pool: &DatabaseConnection,
+    older_than: Duration,
+) -> Result<u64, MessagingError> {
+    purge(pool, PURGE_PROCESSED_CONSUMER_INBOX_SQL, older_than).await
 }
 
 /// A DB-coupled outbox drainer. It atomically commits an expiring owner lease on
@@ -343,7 +495,7 @@ pub async fn inbox_mark_processed(
 // the broker has durably stored it — the same guarantee codex got from
 // `nats.flush()`.
 pub struct OutboxPublisher<'a> {
-    pool: &'a PgPool,
+    pool: &'a DatabaseConnection,
     publisher: &'a dyn Publisher,
     batch_size: i64,
     max_attempts: i32,
@@ -351,9 +503,9 @@ pub struct OutboxPublisher<'a> {
 }
 
 impl<'a> OutboxPublisher<'a> {
-    /// Build a publisher over a pool and a [`Publisher`]. Defaults: batch of
-    /// 100, up to 8 attempts before a row is parked as `failed`.
-    pub fn new(pool: &'a PgPool, publisher: &'a dyn Publisher) -> Self {
+    /// Build a publisher over a connection and a [`Publisher`]. Defaults: batch
+    /// of 100, up to 8 attempts before a row is parked as `failed`.
+    pub fn new(pool: &'a DatabaseConnection, publisher: &'a dyn Publisher) -> Self {
         OutboxPublisher {
             pool,
             publisher,
@@ -405,10 +557,14 @@ impl<'a> OutboxPublisher<'a> {
             let bytes = match serde_json::to_vec(&record.payload) {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    self.record_failure(&record, claim_owner, &error.to_string())
+                    // A payload that cannot re-serialize is a deterministic row
+                    // defect exactly like a malformed subject: retrying cannot
+                    // succeed. Park it (with the loud dead-letter log below)
+                    // instead of burning all attempts on backoff and stopping
+                    // the whole batch for one poison row.
+                    self.park_failed(&record, claim_owner, &error.to_string())
                         .await?;
-                    release_outbox_claims(self.pool, claim_owner).await?;
-                    break;
+                    continue;
                 }
             };
             if let Err(error) = validate_for_publish(&record.subject, bytes.len()) {
@@ -416,7 +572,8 @@ impl<'a> OutboxPublisher<'a> {
                 // oversize payload, e.g. staged before this guard existed):
                 // retrying cannot succeed, so park the row for operator
                 // attention instead of burning attempts and blocking the batch.
-                mark_failed(self.pool, record.id, claim_owner, &error.to_string()).await?;
+                self.park_failed(&record, claim_owner, &error.to_string())
+                    .await?;
                 continue;
             }
             match self
@@ -448,45 +605,80 @@ impl<'a> OutboxPublisher<'a> {
     ) -> Result<(), MessagingError> {
         let attempts = i32::try_from(record.attempts).unwrap_or(i32::MAX);
         if attempts >= self.max_attempts {
-            mark_failed(self.pool, record.id, claim_owner, error).await?;
+            self.park_failed(record, claim_owner, error).await?;
         } else {
+            tracing::warn!(
+                id = %record.id,
+                subject = %record.subject,
+                attempts = record.attempts,
+                error,
+                "outbox: publish failed; rescheduled with backoff"
+            );
             reschedule_publish(self.pool, record.id, claim_owner, error).await?;
         }
         Ok(())
     }
 
+    /// Park a row as `failed` — the outbox's dead letter. This is the moment a
+    /// durable domain event permanently stops flowing to the bus, so it must be
+    /// loud: without this log line the only trace is a row an operator would
+    /// have to find with `SELECT ... WHERE status = 'failed'`.
+    async fn park_failed(
+        &self,
+        record: &OutboxRecord,
+        claim_owner: Uuid,
+        error: &str,
+    ) -> Result<(), MessagingError> {
+        tracing::error!(
+            id = %record.id,
+            subject = %record.subject,
+            attempts = record.attempts,
+            error,
+            "outbox: message parked as failed (dead-lettered); it will NOT be \
+             retried — inspect message_outbox WHERE status = 'failed'"
+        );
+        mark_failed(self.pool, record.id, claim_owner, error).await?;
+        Ok(())
+    }
+
     /// Drain forever on a fixed interval. A batch failure is logged and the loop
-    /// continues (folded from codex's `run`, using `eprintln!` to keep the crate
-    /// free of a tracing dependency).
+    /// continues. Prefer [`run_until`](Self::run_until) in deployables so a
+    /// SIGTERM drains cleanly instead of stranding claims.
     pub async fn run(self, interval: Duration) -> Result<(), MessagingError> {
+        self.run_until(interval, std::future::pending::<()>()).await
+    }
+
+    /// Drain on a fixed interval until `shutdown` resolves, then return.
+    ///
+    /// The in-flight batch always completes first (the shutdown race happens
+    /// only between batches), so every leased row is marked or released before
+    /// exit. Without this, a rolling restart kills the relay mid-batch and the
+    /// claimed rows sit unpublishable until the claim TTL (minutes) expires —
+    /// on every single deploy.
+    pub async fn run_until(
+        self,
+        interval: Duration,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> Result<(), MessagingError> {
         let mut timer = tokio::time::interval(interval);
+        // A slow batch must not be chased by a burst of make-up ticks.
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tokio::pin!(shutdown);
         loop {
-            timer.tick().await;
-            if let Err(error) = self.publish_batch().await {
-                eprintln!("fiducia outbox publish batch failed: {error}");
+            tokio::select! {
+                biased; // a pending shutdown wins over a due tick
+                _ = &mut shutdown => {
+                    tracing::info!("outbox: shutdown signal received; stopping after the drained batch");
+                    return Ok(());
+                }
+                _ = timer.tick() => {
+                    if let Err(error) = self.publish_batch().await {
+                        tracing::error!(%error, "outbox: publish batch failed; retrying on the next interval");
+                    }
+                }
             }
         }
     }
-}
-
-fn row_to_outbox(row: &sqlx::postgres::PgRow) -> Result<OutboxRecord, MessagingError> {
-    let status_str: String = row.try_get("status").map_err(MessagingError::database)?;
-    let attempts: i32 = row.try_get("attempts").map_err(MessagingError::database)?;
-    Ok(OutboxRecord {
-        id: row.try_get("id").map_err(MessagingError::database)?,
-        subject: row.try_get("subject").map_err(MessagingError::database)?,
-        tenant_id: row.try_get("tenant_id").map_err(MessagingError::database)?,
-        idempotency_key: row
-            .try_get("idempotency_key")
-            .map_err(MessagingError::database)?,
-        dedup_id: row.try_get("dedup_id").map_err(MessagingError::database)?,
-        payload: row.try_get("payload").map_err(MessagingError::database)?,
-        created_at: row
-            .try_get("created_at")
-            .map_err(MessagingError::database)?,
-        status: OutboxStatus::from_str(&status_str).unwrap_or(OutboxStatus::Pending),
-        attempts: attempts.max(0) as u32,
-    })
 }
 
 #[cfg(test)]
@@ -513,5 +705,48 @@ mod tests {
         assert!(HARDENING_SCHEMA_SQL.contains("message_inbox_tenant_idempotency_uq"));
         assert!(CLAIM_PENDING_SQL.contains("claim_expires_at <= now()"));
         assert!(CLAIM_PENDING_SQL.contains("claim_owner = $2"));
+    }
+
+    // The claim increments attempts up front; release must undo it for rows the
+    // batch never reached, or a broker outage marches the whole claimable
+    // window to max_attempts without a single real publish attempt.
+    #[test]
+    fn release_undoes_the_claim_attempt_increment() {
+        assert!(CLAIM_PENDING_SQL.contains("attempts = outbox.attempts + 1"));
+        assert!(RELEASE_CLAIMS_SQL.contains("attempts = greatest(attempts - 1, 0)"));
+        assert!(RELEASE_CLAIMS_SQL.contains("status = 'pending' AND claim_owner = $1"));
+    }
+
+    // Purges may only ever remove terminal rows: published outbox rows and
+    // processed inbox claims. Pending work and the failed dead-letter queue
+    // must never match, and every purge must be time-bounded.
+    #[test]
+    fn purges_target_only_terminal_rows_and_are_time_bounded() {
+        assert!(PURGE_PUBLISHED_OUTBOX_SQL.contains("status = 'published'"));
+        assert!(PURGE_PUBLISHED_OUTBOX_SQL.contains("published_at IS NOT NULL"));
+        assert!(!PURGE_PUBLISHED_OUTBOX_SQL.contains("failed"));
+        for sql in [PURGE_PROCESSED_INBOX_SQL, PURGE_PROCESSED_CONSUMER_INBOX_SQL] {
+            assert!(sql.contains("processed_at IS NOT NULL"));
+        }
+        for sql in [
+            PURGE_PUBLISHED_OUTBOX_SQL,
+            PURGE_PROCESSED_INBOX_SQL,
+            PURGE_PROCESSED_CONSUMER_INBOX_SQL,
+        ] {
+            assert!(sql.trim_start().starts_with("DELETE FROM"));
+            assert!(sql.contains("now() - ($1 * interval '1 millisecond')"));
+        }
+        assert!(RETENTION_SCHEMA_SQL.contains("message_outbox_published_retention_idx"));
+        assert!(RETENTION_SCHEMA_SQL.contains("message_inbox_retention_idx"));
+    }
+
+    #[test]
+    fn positive_ms_rejects_zero_and_overflow() {
+        assert_eq!(positive_ms(Duration::from_millis(1500), "x").unwrap(), 1500);
+        assert!(positive_ms(Duration::ZERO, "x").is_err());
+        // sub-millisecond truncates to 0 -> rejected, not an instant lease
+        assert!(positive_ms(Duration::from_micros(900), "x").is_err());
+        // u128 millis beyond i64 -> rejected, not a wrapped negative interval
+        assert!(positive_ms(Duration::from_secs(u64::MAX), "x").is_err());
     }
 }

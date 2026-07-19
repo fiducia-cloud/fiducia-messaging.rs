@@ -1,9 +1,16 @@
 use crate::compat_envelope::Envelope;
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, DbErr, FromQueryResult,
+    Statement, TransactionTrait,
+};
 use serde::Serialize;
-use sqlx::{PgPool, Postgres, Transaction};
 use std::time::Duration;
 use uuid::Uuid;
 
+// The compat service's contract is these exact SQL strings (see the
+// `compatibility_queries_match_the_canonical_migration` test), so they run
+// verbatim through `sea_orm::Statement` rather than being re-expressed in the
+// entity API.
 const COMPAT_ENQUEUE_SQL: &str =
     "INSERT INTO message_outbox_compat (message_id, tenant_id, subject, envelope) VALUES ($1,$2,$3,$4)";
 const COMPAT_CLAIM_SQL: &str =
@@ -43,17 +50,17 @@ fn validate_compat_publish(subject: &str, payload_len: usize) -> Result<(), Outb
 /// Transaction-scoped outbox facade retained from the original service.
 #[derive(Clone)]
 pub struct Outbox {
-    _pool: PgPool,
+    _pool: DatabaseConnection,
 }
 
 impl Outbox {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: DatabaseConnection) -> Self {
         Self { _pool: pool }
     }
 
     pub async fn enqueue<T: Serialize>(
         &self,
-        tx: &mut Transaction<'_, Postgres>,
+        tx: &DatabaseTransaction,
         subject: &str,
         envelope: &Envelope<T>,
     ) -> Result<(), OutboxError> {
@@ -63,25 +70,37 @@ impl Outbox {
         validate_compat_publish(subject, 0)?;
         let body = envelope.encode()?;
         validate_compat_publish(subject, body.len())?;
-        sqlx::query(COMPAT_ENQUEUE_SQL)
-            .bind(envelope.message_id)
-            .bind(envelope.tenant_id)
-            .bind(subject)
-            .bind(body)
-            .execute(&mut **tx)
-            .await?;
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            COMPAT_ENQUEUE_SQL,
+            [
+                envelope.message_id.into(),
+                envelope.tenant_id.into(),
+                subject.into(),
+                body.into(),
+            ],
+        ))
+        .await?;
         Ok(())
     }
 }
 
+/// The `COMPAT_CLAIM_SQL` row shape (raw SQL: `FOR UPDATE SKIP LOCKED`).
+#[derive(FromQueryResult)]
+struct CompatClaimedRow {
+    message_id: Uuid,
+    subject: String,
+    envelope: Vec<u8>,
+}
+
 pub struct OutboxPublisher {
-    pool: PgPool,
+    pool: DatabaseConnection,
     nats: async_nats::Client,
     batch_size: i64,
 }
 
 impl OutboxPublisher {
-    pub fn new(pool: PgPool, nats: async_nats::Client) -> Self {
+    pub fn new(pool: DatabaseConnection, nats: async_nats::Client) -> Self {
         Self {
             pool,
             nats,
@@ -90,23 +109,32 @@ impl OutboxPublisher {
     }
 
     pub async fn publish_batch(&self) -> Result<u64, OutboxError> {
-        let mut tx = self.pool.begin().await?;
-        let rows: Vec<(Uuid, String, Vec<u8>)> = sqlx::query_as(COMPAT_CLAIM_SQL)
-            .bind(self.batch_size)
-            .fetch_all(&mut *tx)
-            .await?;
+        let tx = self.pool.begin().await?;
+        let rows = CompatClaimedRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            COMPAT_CLAIM_SQL,
+            [self.batch_size.into()],
+        ))
+        .all(&tx)
+        .await?;
         let mut published = 0;
-        for (message_id, subject, body) in rows {
+        for CompatClaimedRow {
+            message_id,
+            subject,
+            envelope: body,
+        } in rows
+        {
             if let Err(error) = validate_compat_publish(&subject, body.len()) {
                 // Legacy rows may predate the enqueue guard. Never hand a
                 // wildcard/injected subject or oversize payload to NATS; retain
                 // the row with durable error/backoff metadata for operator
                 // inspection, then continue with the rest of the batch.
-                sqlx::query(COMPAT_RESCHEDULE_SQL)
-                    .bind(message_id)
-                    .bind(error.to_string())
-                    .execute(&mut *tx)
-                    .await?;
+                tx.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    COMPAT_RESCHEDULE_SQL,
+                    [message_id.into(), error.to_string().into()],
+                ))
+                .await?;
                 continue;
             }
             // Tag the publish with the envelope's message_id as `Nats-Msg-Id` so
@@ -127,18 +155,21 @@ impl OutboxPublisher {
                         .flush()
                         .await
                         .map_err(|error| OutboxError::Nats(error.to_string()))?;
-                    sqlx::query(COMPAT_MARK_PUBLISHED_SQL)
-                        .bind(message_id)
-                        .execute(&mut *tx)
-                        .await?;
+                    tx.execute(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        COMPAT_MARK_PUBLISHED_SQL,
+                        [message_id.into()],
+                    ))
+                    .await?;
                     published += 1;
                 }
                 Err(error) => {
-                    sqlx::query(COMPAT_RESCHEDULE_SQL)
-                        .bind(message_id)
-                        .bind(error.to_string())
-                        .execute(&mut *tx)
-                        .await?;
+                    tx.execute(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        COMPAT_RESCHEDULE_SQL,
+                        [message_id.into(), error.to_string().into()],
+                    ))
+                    .await?;
                     break;
                 }
             }
@@ -152,7 +183,7 @@ impl OutboxPublisher {
         loop {
             timer.tick().await;
             if let Err(error) = self.publish_batch().await {
-                eprintln!("outbox publish batch failed: {error}");
+                tracing::error!(%error, "compat outbox: publish batch failed; retrying on the next interval");
             }
         }
     }
@@ -167,7 +198,7 @@ pub enum OutboxError {
     #[error(transparent)]
     Envelope(#[from] crate::compat_envelope::EnvelopeError),
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
+    Database(#[from] DbErr),
     #[error("NATS operation failed: {0}")]
     Nats(String),
 }

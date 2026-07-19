@@ -59,7 +59,7 @@
 //! ## Feature flags
 //!
 //! The default build needs no network and no external services. Optional:
-//! * `postgres` — a real sqlx-backed outbox/inbox repo ([`db`]).
+//! * `postgres` — a real SeaORM-backed outbox/inbox repo ([`db`]).
 //! * `nats` — a real JetStream publisher ([`NatsPublisher`](publisher::NatsPublisher)).
 //!
 //! [`fiducia-node`]: https://github.com/fiducia-cloud/fiducia-node.rs
@@ -85,6 +85,11 @@ pub mod compat_envelope;
 /// equivalents are [`Relay`](outbox::Relay) / [`OutboxPublisher`](db::OutboxPublisher).
 #[cfg(feature = "compat-service")]
 pub mod transactional;
+
+/// SeaORM entities for the durable tables (`message_outbox`, `message_inbox`,
+/// `message_inbox_consumer`). Behind `postgres`.
+#[cfg(feature = "postgres")]
+pub mod entity;
 
 #[cfg(feature = "postgres")]
 pub mod db;

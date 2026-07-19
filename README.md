@@ -14,6 +14,29 @@ JetStream does that better than we would. The default build pulls in no NATS
 client and no database driver and needs no network: `cargo test --locked` runs entirely
 in-memory.
 
+## Adoption status (honest snapshot)
+
+The crate is complete, but **no service depends on it yet** — this is the gap,
+not the design. As of the 2026-07 audit:
+
+- The only NATS producers in the fleet (`fiducia-ai-agent-manager`,
+  `fiducia-lambda-service`) publish directly with local copies of the envelope.
+  They now set a tenant-scoped `Nats-Msg-Id`, self-heal their connections, and
+  log durability downgrades — but they still bypass the transactional outbox,
+  so a crash between a DB commit and the publish can drop an event.
+- The `fiducia-relay` binary is **not yet deployed** (`fiducia-infra` carries no
+  NATS server, no stream provisioning, and no relay workload). Until a JetStream
+  stream covers the `fiducia.*` subjects, producer publishes fall back to Core
+  NATS: at-most-once.
+- There are **no consumers** of the published events in any fiducia repo yet,
+  so the consumer-inbox discipline (§ typical consumer, `PgInbox`) is exercised
+  only by this crate's tests.
+
+Adoption path: provision the JetStream streams in `fiducia-infra`, deploy
+`fiducia-relay`, move the two producers onto `enqueue_outbox_tx` inside their
+domain transactions, and build consumers on `PgInbox` +
+`require_fencing_token()`.
+
 ## The core principle
 
 > Messages say something *happened* or *request* work; fiducia-node decides who
@@ -167,7 +190,7 @@ Both are **off by default**; the crate builds and tests with neither.
 
 | feature | adds |
 | --- | --- |
-| `postgres` | `db` module — sqlx-backed outbox/inbox repo (`apply_schema`, `enqueue_outbox`, `enqueue_outbox_tx`, leased `claim_pending_outbox`, owner-conditioned marks, scoped inbox, …) plus `OutboxPublisher`; and the `inbox` module — the per-consumer `PgInbox`. Runtime-checked queries, so no `DATABASE_URL` at build. Forward-only schema files live in [`migrations/`](migrations/) and are embedded as `db::SCHEMA_SQL` / `db::HARDENING_SCHEMA_SQL`; run the directory with `sqlx::migrate!` or use `db::apply_schema`. |
+| `postgres` | `db` module — SeaORM-backed outbox/inbox repo (`apply_schema`, `enqueue_outbox`, `enqueue_outbox_tx`, leased `claim_pending_outbox`, owner-conditioned marks, scoped inbox, …) plus `OutboxPublisher`; the `entity` module (SeaORM entities for the three tables); and the `inbox` module — the per-consumer `PgInbox`. Entity-API queries where expressible, `sea_orm::Statement` for the SKIP LOCKED / backoff SQL — runtime-checked either way, so no `DATABASE_URL` at build. Forward-only schema files live in [`migrations/`](migrations/) and are embedded as `db::SCHEMA_SQL` / `db::HARDENING_SCHEMA_SQL`; apply them declaratively out-of-band or via `db::apply_schema`. |
 | `nats` | `NatsPublisher` — a real JetStream `Publisher` that sets `Nats-Msg-Id` for publish dedup. |
 
 The `fiducia-relay` binary (a thin outbox→JetStream drain loop) is built with

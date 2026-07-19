@@ -2,7 +2,7 @@
 # standard message envelope, the transactional outbox/inbox pattern, and the
 # subject taxonomy. It is NOT a broker: JetStream delivers, fiducia-node stays
 # the authority, Postgres holds state. The default build requires no external
-# services and no network (async-nats and sqlx are optional).
+# services and no network (async-nats and sea-orm are optional).
 [package]
 name = "fiducia-messaging"
 version = "0.1.0"
@@ -19,35 +19,71 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 thiserror = "2"
 async-trait = "0.1"
 sha2 = "0.11"
+# Structured logging facade only (no subscriber, no I/O): a no-op unless the
+# embedding service installs a subscriber. Operator-critical events — a message
+# parked as failed, a batch drain error — must reach the same log pipeline as
+# every other fiducia service instead of raw stderr.
+tracing = "0.1"
 
 # The async `Publisher` trait's runtime + the relay binary's `#[tokio::main]`,
 # and the `#[tokio::test]` harness. No live services are touched by the tests.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+# `signal` powers the relay's graceful SIGTERM/SIGINT drain (run_until).
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 
 # Optional: a real Postgres-backed outbox/inbox repository (the `postgres`
-# feature). Runtime-checked queries only, so no DATABASE_URL is needed at build.
-sqlx = { version = "0.9", default-features = false, features = [
-    "runtime-tokio",
-    "postgres",
-    "uuid",
-    "chrono",
-    "json",
-    # `migrate` + `macros` power the `migrations/` dir: the `sqlx::migrate!`
-    # macro in the relay binary embeds and runs the tracked migrations.
-    "migrate",
+# feature). SeaORM is the house database layer: entity-API queries where the
+# query is expressible, `sea_orm::Statement` for the SKIP LOCKED / backoff SQL.
+# Runtime-checked either way, so no DATABASE_URL is needed at build. Schema in
+# `migrations/` is applied declaratively (dpm) or via `db::apply_schema` — not
+# by a boot-time migrator.
+sea-orm = { version = "1", default-features = false, features = [
     "macros",
+    "runtime-tokio-rustls",
+    "sqlx-postgres",
+    "with-chrono",
+    "with-json",
+    "with-uuid",
 ], optional = true }
 
 # Optional: a real NATS JetStream publisher (the `nats` feature). The default
 # build must NOT pull this in — the crate builds and tests with no network.
 async-nats = { version = "0.49.1", default-features = false, features = ["jetstream", "ring"], optional = true }
 
+# Optional: the JSON log subscriber for the deployable binaries (relay/compat).
+# Library consumers install their own subscriber; the default offline build
+# stays free of it.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "json",
+    "env-filter",
+    "ansi",
+], optional = true }
+
+# Optional: the shared fleet telemetry crate (the `telemetry` feature) — JSON
+# logs plus OTLP traces and metrics when OTEL_EXPORTER_OTLP_ENDPOINT is set.
+# Only the deployable binaries pull this in; see the `telemetry` feature below
+# for why it is deliberately NOT implied by `nats`.
+fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.2.1", optional = true }
+
 [features]
 default = []
 # Postgres-backed outbox/inbox repo + schema apply.
-postgres = ["dep:sqlx"]
-# Real JetStream `Publisher` (`NatsPublisher`).
-nats = ["dep:async-nats"]
+postgres = ["dep:sea-orm"]
+# Real JetStream `Publisher` (`NatsPublisher`) + the JSON log subscriber the
+# relay/compat binaries initialize (a networked deployable needs real logs).
+nats = ["dep:async-nats", "dep:tracing-subscriber"]
+# OTLP traces + metrics for the deployable binaries, via the shared fleet crate.
+#
+# This is a standalone feature rather than part of `nats` on purpose. Library
+# consumers (fiducia-lambda-service, fiducia-ai-agent-manager) enable `nats` on
+# this crate while depending on fiducia-telemetry themselves by *path*. Cargo
+# keys a crate on (source, version), so a git-sourced copy here plus their
+# path-sourced copy would be two distinct crates in one build graph — and thus
+# two independent `opentelemetry::global` statics, where spans recorded through
+# one are invisible to the exporter installed by the other. Keeping this opt-in
+# means only our own binaries (built from this repo, where nothing else links
+# fiducia-telemetry) ever pull it in.
+telemetry = ["dep:fiducia-telemetry"]
 # The original codex-authored direct PostgreSQL/NATS service, preserved verbatim
 # for wire/API backward-compat: `transactional::{Outbox, OutboxPublisher}` over
 # `compat_envelope::Envelope`, plus the `fiducia-messaging-compat` binary.
