@@ -13,9 +13,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use fiducia_messaging::publisher::NatsPublisher;
     use fiducia_messaging::OutboxPublisher;
 
-    // JSON structured logs, level from RUST_LOG (default info) — the same log
-    // contract as the rest of the fleet, so a parked (dead-lettered) outbox row
-    // or a batch failure is visible to the log pipeline, not lost on raw stderr.
+    // Telemetry. With `--features telemetry` the shared fleet crate owns the
+    // subscriber: JSON logs *plus* OTLP traces and metrics when
+    // OTEL_EXPORTER_OTLP_ENDPOINT is set (stdout-only when it is not). The relay
+    // is a long-running drain loop, so outbox lag and dead-letter counts belong
+    // on the same collector path as the rest of the fleet rather than only in
+    // log lines. The guard must stay bound for the whole of `main` — dropping it
+    // flushes and shuts the exporters down, so `let _ =` here would export
+    // nothing.
+    #[cfg(feature = "telemetry")]
+    let _telemetry = fiducia_telemetry::init("fiducia-relay");
+
+    // Without the feature, keep the previous local JSON logs so the binary still
+    // builds and behaves with just `postgres,nats`. Same log contract either way:
+    // a parked (dead-lettered) outbox row or a batch failure reaches the log
+    // pipeline instead of raw stderr.
+    #[cfg(not(feature = "telemetry"))]
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(

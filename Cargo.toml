@@ -59,6 +59,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "ansi",
 ], optional = true }
 
+# Optional: the shared fleet telemetry crate (the `telemetry` feature) — JSON
+# logs plus OTLP traces and metrics when OTEL_EXPORTER_OTLP_ENDPOINT is set.
+# Only the deployable binaries pull this in; see the `telemetry` feature below
+# for why it is deliberately NOT implied by `nats`.
+fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.2.1", optional = true }
+
 [features]
 default = []
 # Postgres-backed outbox/inbox repo + schema apply.
@@ -66,6 +72,18 @@ postgres = ["dep:sea-orm"]
 # Real JetStream `Publisher` (`NatsPublisher`) + the JSON log subscriber the
 # relay/compat binaries initialize (a networked deployable needs real logs).
 nats = ["dep:async-nats", "dep:tracing-subscriber"]
+# OTLP traces + metrics for the deployable binaries, via the shared fleet crate.
+#
+# This is a standalone feature rather than part of `nats` on purpose. Library
+# consumers (fiducia-lambda-service, fiducia-ai-agent-manager) enable `nats` on
+# this crate while depending on fiducia-telemetry themselves by *path*. Cargo
+# keys a crate on (source, version), so a git-sourced copy here plus their
+# path-sourced copy would be two distinct crates in one build graph — and thus
+# two independent `opentelemetry::global` statics, where spans recorded through
+# one are invisible to the exporter installed by the other. Keeping this opt-in
+# means only our own binaries (built from this repo, where nothing else links
+# fiducia-telemetry) ever pull it in.
+telemetry = ["dep:fiducia-telemetry"]
 # The original codex-authored direct PostgreSQL/NATS service, preserved verbatim
 # for wire/API backward-compat: `transactional::{Outbox, OutboxPublisher}` over
 # `compat_envelope::Envelope`, plus the `fiducia-messaging-compat` binary.
