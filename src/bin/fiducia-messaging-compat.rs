@@ -4,8 +4,16 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Same JSON log contract as the fleet (and the integrated relay), so batch
-    // failures reach the log pipeline instead of raw stderr.
+    // Same telemetry contract as the integrated relay: with `--features
+    // telemetry` the shared fleet crate installs JSON logs plus OTLP traces and
+    // metrics; the guard stays bound for the whole of `main` because dropping it
+    // shuts the exporters down.
+    #[cfg(feature = "telemetry")]
+    let _telemetry = fiducia_telemetry::init("fiducia-messaging-compat");
+
+    // Fallback for a build without the feature — JSON logs only, so batch
+    // failures still reach the log pipeline instead of raw stderr.
+    #[cfg(not(feature = "telemetry"))]
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
