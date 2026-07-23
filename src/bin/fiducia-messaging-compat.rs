@@ -30,7 +30,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = Database::connect(options).await?;
     // Schema is applied declaratively out-of-band (`migrations/` is the source
     // of truth) — no boot-time migrator here.
-    let nats = async_nats::connect(nats_url).await?;
+    // Same TLS/credentials policy as the integrated relay: non-loopback
+    // endpoints require TLS unless explicitly opted out, NATS_CREDS_FILE keeps
+    // credentials off the URL, and the URL is never logged.
+    let nats = fiducia_messaging::connect::connect(&nats_url).await?;
+    // The compat publisher now awaits JetStream acks (see `transactional`), so
+    // canonical `fiducia.*` subjects need the stream in place with a dedup
+    // window that satisfies the crate invariant — same fail-closed check as the
+    // relay. Legacy non-`fiducia.*` subjects are outside this stream; their
+    // publishes surface as per-row errors with backoff metadata instead of
+    // being silently fire-and-forget.
+    let js = async_nats::jetstream::new(nats.clone());
+    let stream_config =
+        fiducia_messaging::stream::config_from_env(fiducia_messaging::DEFAULT_CLAIM_TTL)?;
+    fiducia_messaging::stream::ensure_stream(
+        &js,
+        stream_config,
+        fiducia_messaging::DEFAULT_CLAIM_TTL,
+    )
+    .await?;
     tracing::info!("fiducia compatibility outbox publisher started");
     OutboxPublisher::new(pool, nats)
         .run(Duration::from_millis(250))

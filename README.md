@@ -217,8 +217,20 @@ the environment (`src/main.rs`):
 | var | required | secret | description |
 | --- | --- | --- | --- |
 | `DATABASE_URL` | yes | **yes** | Postgres connection string, e.g. `postgres://user:pass@host/db`. **Carries DB credentials** — never log it, keep it out of shell history and CI logs. The relay exits if it is unset. |
-| `NATS_URL` | no | no | NATS server URL. Defaults to `nats://localhost:4222`. May embed credentials if your deployment uses `nats://user:pass@host`; treat as secret then. |
+| `NATS_URL` | yes | no | NATS server URL (comma-separated list allowed). **No default** — the relay exits if it is unset rather than falling back to anonymous plaintext localhost. May embed credentials if your deployment uses `nats://user:pass@host`; treat as secret then (prefer `NATS_CREDS_FILE`). |
+| `NATS_CREDS_FILE` | no | **yes** | Path to an nkey/JWT `.creds` file passed to the NATS client, so credentials never ride the URL. |
+| `FIDUCIA_NATS_REQUIRE_TLS` | no | no | `1`/`true` — require TLS even for loopback endpoints. Non-loopback endpoints always require TLS unless explicitly opted out. |
+| `FIDUCIA_NATS_ALLOW_PLAINTEXT` | no | no | `1`/`true` — explicit opt-out: allow plaintext to a non-loopback endpoint. Logged loudly; `FIDUCIA_NATS_REQUIRE_TLS` wins if both are set. |
+| `FIDUCIA_STREAM_REPLICAS` | no | no | JetStream replica count (1–5) for the `FIDUCIA_MESSAGES` stream the relay provisions. Defaults to `1`; invalid values are a startup error. |
+| `FIDUCIA_STREAM_MAX_AGE_HOURS` | no | no | Limits-retention message age for that stream, in hours (`0` = no age limit). Defaults to 168 (7 days); invalid values are a startup error. |
 | `RELAY_BATCH` | no | no | Integer — outbox rows claimed per drain batch. Defaults to `100`; unparseable values fall back to the default. |
+
+At startup the relay ensures the `FIDUCIA_MESSAGES` stream (subjects
+`fiducia.>`, file storage, limits retention) exists with a `duplicate_window`
+of at least `claim_ttl + MAX_PUBLISH_BACKOFF` (600s with the defaults) — the
+broker-side dedup invariant `min_duplicate_window` documents. If the stream
+already exists with a smaller window, the relay **fails closed** instead of
+publishing into a stream that would double-deliver a crash-window re-publish.
 
 The `fiducia-messaging-compat` binary (feature `compat-service`) reads
 `DATABASE_URL` and `NATS_URL` with the same meaning (both required there).

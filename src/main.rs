@@ -39,8 +39,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db_url = std::env::var("DATABASE_URL")
         .map_err(|_| "DATABASE_URL must be set (e.g. postgres://user:pass@host/db)")?;
-    let nats_url =
-        std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
+    // No default: a relay silently falling back to anonymous plaintext
+    // localhost is a fail-open misconfiguration, not a convenience.
+    let nats_url = std::env::var("NATS_URL")
+        .map_err(|_| "NATS_URL must be set; the relay does not default to localhost")?;
     let batch_size: i64 = std::env::var("RELAY_BATCH")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -54,8 +56,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A caller that owns its own database can still run
     // `fiducia_messaging::db::apply_schema` explicitly.
 
-    let client = async_nats::connect(&nats_url).await?;
+    // TLS is policy, not luck: non-loopback endpoints require TLS unless
+    // explicitly opted out, and NATS_CREDS_FILE keeps credentials off the URL
+    // (see `connect`). The URL itself is never logged.
+    let client = fiducia_messaging::connect::connect(&nats_url).await?;
     let js = async_nats::jetstream::new(client);
+    // Fail closed before the first publish: ensure the `fiducia.*` stream
+    // exists with an explicit config and that its duplicate_window covers
+    // `min_duplicate_window(claim_ttl)` — JetStream's 2-minute default window
+    // silently double-delivers a crash-window re-publish otherwise.
+    let stream_config =
+        fiducia_messaging::stream::config_from_env(fiducia_messaging::DEFAULT_CLAIM_TTL)?;
+    fiducia_messaging::stream::ensure_stream(
+        &js,
+        stream_config,
+        fiducia_messaging::DEFAULT_CLAIM_TTL,
+    )
+    .await?;
     let publisher = NatsPublisher::new(js);
 
     // The DB-coupled drainer: durable expiring claim leases, exponential

@@ -66,11 +66,19 @@
 
 #![forbid(unsafe_code)]
 
+pub mod connect;
 pub mod envelope;
 pub mod error;
 pub mod outbox;
 pub mod publisher;
 pub mod subjects;
+
+/// JetStream stream provisioning/verification — creates the `fiducia.*` stream
+/// with an explicit config and fails closed when a deployed stream's
+/// `duplicate_window` is below [`min_duplicate_window`](outbox::min_duplicate_window).
+/// Behind `nats` (it speaks to the broker).
+#[cfg(feature = "nats")]
+pub mod stream;
 
 /// The original, non-suffixed `Envelope<T>` from the codex-authored service,
 /// retained verbatim for **wire backward-compatibility** (its exact serialized

@@ -103,15 +103,19 @@ struct CompatClaimedRow {
 
 pub struct OutboxPublisher {
     pool: DatabaseConnection,
-    nats: async_nats::Client,
+    js: async_nats::jetstream::Context,
     batch_size: i64,
 }
 
 impl OutboxPublisher {
+    /// Wrap a NATS client. The client is wrapped in a JetStream context so
+    /// every publish is confirmed by a **server ack** before the row is marked
+    /// published — `flush()` only proved the bytes left the client buffer,
+    /// which let the DB report success for a message the broker never stored.
     pub fn new(pool: DatabaseConnection, nats: async_nats::Client) -> Self {
         Self {
             pool,
-            nats,
+            js: async_nats::jetstream::new(nats),
             batch_size: 100,
         }
     }
@@ -146,23 +150,26 @@ impl OutboxPublisher {
                 continue;
             }
             // Tag the publish with the envelope's message_id as `Nats-Msg-Id` so
-            // a JetStream stream over this subject collapses a crash-window
+            // the JetStream stream over this subject collapses a crash-window
             // re-publish (published-but-not-marked) into one stored message — the
-            // same dedup the integrated path gets from `dedup_id`. On a plain
-            // core-NATS subject the header is simply ignored, so this is safe
-            // either way and costs nothing.
+            // same dedup the integrated path gets from `dedup_id`. Publishing
+            // through the JetStream context and awaiting the server ack (mirroring
+            // `NatsPublisher`) is what makes "published" mean *durably stored*:
+            // a subject no stream covers, or a broker that drops the message,
+            // now surfaces as a per-row error with backoff metadata instead of a
+            // fire-and-forget flush() the DB records as success.
             let mut headers = async_nats::HeaderMap::new();
             headers.insert("Nats-Msg-Id", message_id.to_string().as_str());
-            match self
-                .nats
+            let publish = match self
+                .js
                 .publish_with_headers(subject, headers, body.into())
                 .await
             {
+                Ok(ack) => ack.await.map(|_ack| ()),
+                Err(error) => Err(error),
+            };
+            match publish {
                 Ok(()) => {
-                    self.nats
-                        .flush()
-                        .await
-                        .map_err(|error| OutboxError::Nats(error.to_string()))?;
                     tx.execute(Statement::from_sql_and_values(
                         DbBackend::Postgres,
                         COMPAT_MARK_PUBLISHED_SQL,

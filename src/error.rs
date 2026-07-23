@@ -65,6 +65,14 @@ pub enum MessagingError {
     #[error("transport error: {0}")]
     Transport(String),
 
+    /// Deployment configuration violates a crate invariant — e.g. a JetStream
+    /// stream whose `duplicate_window` is below
+    /// [`min_duplicate_window`](crate::outbox::min_duplicate_window), or an
+    /// unparseable stream-tuning env var. Startup must fail closed on this
+    /// rather than run with silently weakened guarantees.
+    #[error("configuration error: {0}")]
+    Config(String),
+
     /// A Postgres operation failed (only reachable under the `postgres`
     /// feature). Kept as a string so the default build carries no SeaORM.
     #[error("database error: {0}")]
