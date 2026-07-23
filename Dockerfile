@@ -8,7 +8,7 @@ COPY . .
 RUN cargo build --locked --release --bin fiducia-relay --features postgres,nats,telemetry \
     && strip target/release/fiducia-relay
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:ce0d66bc0f64aae46e6a03add867b07f42cc7b8799c949c2e898057b7f75a151
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
 COPY --from=build --chown=65532:65532 /build/target/release/fiducia-relay /usr/local/bin/fiducia-relay
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/fiducia-relay"]
