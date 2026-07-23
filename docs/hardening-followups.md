@@ -15,7 +15,11 @@ batch duration, and there is **no publish timeout** — a hung `flush()` can wed
 the connection indefinitely.
 
 This code is deliberately preserved verbatim for wire/API back-compat, so it was
-not changed in the audit. **Decide:** either (a) harden it to the integrated
+not changed in the audit. (One targeted exception has since landed in the same
+file: `is_publishable_subject` now also rejects UUID tokens, so the compat guard
+enforces the taxonomy's cardinal invariant — identifiers live in the envelope,
+never the subject — like the canonical `subjects::validate_token`. The
+transaction-across-NATS-I/O hazard below is untouched.) **Decide:** either (a) harden it to the integrated
 pattern — claim+commit, release the connection, publish, then mark by owner
 (what `db::OutboxPublisher` does) and add a per-publish timeout — or (b) retire
 the compat launcher once no consumer depends on its exact behavior. Do not leave
@@ -55,6 +59,14 @@ cannot set stream config.
 **Deployment:** assert the stream's `duplicate_window` at provisioning time and
 in a smoke check. The per-consumer inbox (`PgInbox`) is the durable backstop
 beyond the window, but the window keeps the common case off it.
+
+The relay no longer *silently* relies on the window. `db::OutboxPublisher`
+re-checks its lease (`db::claim_still_held`) before each publish, and an
+owner-conditioned `mark_published` that matches no row now logs a warning and
+increments `db::lost_lease_publishes()` — the exact condition under which a row
+stays `pending` and can be published twice. **Deployment:** alert on
+`lost_lease_publishes` being non-zero; it means batches are overrunning
+`claim_ttl` and the window is now load-bearing.
 
 ## 5. Test coverage gap — no live-Postgres integration test
 

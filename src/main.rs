@@ -68,10 +68,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // processed inbox claims older than that age, hourly. Off by default —
     // deleting a processed inbox claim gives up dedup for a very-late replay of
     // that message, so the operator picks the horizon.
+    // `hours * 3600` must not wrap: a wrapped product becomes a TINY retention
+    // age, and the hourly purge would then delete recently-published outbox
+    // rows and freshly-processed inbox claims — giving up dedup for redeliveries
+    // still in flight. A value that cannot be a duration is a misconfiguration.
     if let Some(retention_hours) = std::env::var("RELAY_RETENTION_HOURS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .filter(|hours| *hours > 0)
+        .filter(|hours| *hours > 0 && hours.checked_mul(3600).is_some())
     {
         fn log_purge(table: &str, result: Result<u64, fiducia_messaging::MessagingError>) {
             match result {
@@ -80,9 +84,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => tracing::warn!(table, %error, "retention: purge failed"),
             }
         }
-        let retention = Duration::from_secs(retention_hours * 3600);
+        let retention = Duration::from_secs(
+            retention_hours
+                .checked_mul(3600)
+                .expect("filtered above: retention_hours * 3600 fits u64"),
+        );
         let purge_pool = pool.clone();
-        tracing::info!(retention_hours, "fiducia-relay: hourly retention purge enabled");
+        tracing::info!(
+            retention_hours,
+            "fiducia-relay: hourly retention purge enabled"
+        );
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(Duration::from_secs(3600));
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -126,7 +137,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     tracing::info!("fiducia-relay: draining message_outbox to the configured NATS endpoint");
-    outbox.run_until(Duration::from_millis(500), shutdown).await?;
+    outbox
+        .run_until(Duration::from_millis(500), shutdown)
+        .await?;
     tracing::info!("fiducia-relay: stopped cleanly");
     Ok(())
 }

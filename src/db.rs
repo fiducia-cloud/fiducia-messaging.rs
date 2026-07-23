@@ -10,13 +10,14 @@
 //! may run [`apply_schema`] explicitly. These functions are the durable
 //! counterparts to the pure logic in [`crate::outbox`].
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
-    DbBackend, EntityTrait, FromQueryResult, QueryFilter, Statement,
+    DbBackend, EntityTrait, FromQueryResult, QueryFilter, QueryTrait, Statement,
 };
 use uuid::Uuid;
 
@@ -74,7 +75,10 @@ async fn insert_outbox_row<C: ConnectionTrait>(
         dedup_id: Set(rec.dedup_id.clone()),
         payload: Set(rec.payload.clone()),
         status: Set(rec.status.as_str().to_owned()),
-        attempts: Set(rec.attempts as i32),
+        // Saturate rather than wrap: `attempts as i32` turns a count above
+        // `i32::MAX` into a NEGATIVE attempt count, which the backoff and
+        // max-attempts arithmetic then reads as "no attempts yet".
+        attempts: Set(i32::try_from(rec.attempts).unwrap_or(i32::MAX)),
         created_at: Set(rec.created_at),
         ..Default::default()
     })
@@ -247,6 +251,56 @@ pub async fn mark_published(
     Ok(result.rows_affected == 1)
 }
 
+// Raw SQL: an existence probe of the row's *live* lease (`claim_expires_at >
+// now()`), which the entity API cannot express against the database clock.
+const CLAIM_STILL_HELD_SQL: &str = "SELECT id FROM message_outbox
+      WHERE id = $1 AND claim_owner = $2 AND claim_expires_at > now()";
+
+/// The `CLAIM_STILL_HELD_SQL` row shape.
+#[derive(FromQueryResult)]
+struct HeldClaimRow {
+    #[allow(dead_code)]
+    id: Uuid,
+}
+
+/// How many times a relay published a row it no longer owned (see
+/// [`lost_lease_publishes`]).
+static LOST_LEASE_PUBLISHES: AtomicU64 = AtomicU64::new(0);
+
+/// Process-lifetime count of rows this relay published while its claim lease
+/// had already lapsed — i.e. rows another worker may publish again.
+///
+/// A slow broker can push a batch past `claim_ttl`; the row is then reclaimable
+/// and a second worker may publish it. If the gap exceeds the stream's
+/// `duplicate_window` that is a genuine double delivery, so it must never be a
+/// silent outcome. Scrape this alongside the relay's logs.
+pub fn lost_lease_publishes() -> u64 {
+    LOST_LEASE_PUBLISHES.load(Ordering::Relaxed)
+}
+
+fn record_lost_lease() -> u64 {
+    LOST_LEASE_PUBLISHES.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Whether `claim_owner` still holds a *live* (unexpired) lease on `id`.
+/// Checked before handing a row to the broker, so a batch that overran its
+/// `claim_ttl` stops publishing rows another worker has already reclaimed.
+pub async fn claim_still_held(
+    pool: &DatabaseConnection,
+    id: Uuid,
+    claim_owner: Uuid,
+) -> Result<bool, MessagingError> {
+    let row = HeldClaimRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        CLAIM_STILL_HELD_SQL,
+        [id.into(), claim_owner.into()],
+    ))
+    .one(pool)
+    .await
+    .map_err(MessagingError::database)?;
+    Ok(row.is_some())
+}
+
 /// Mark an owned row failed (retries exhausted). Returns `false` if ownership
 /// has already moved to another relay.
 pub async fn mark_failed(
@@ -338,9 +392,39 @@ pub async fn release_outbox_claims(
     Ok(result.rows_affected())
 }
 
-/// Try to record an incoming message for consumer dedup. Returns `true` the
-/// first time this `message_id` is seen and `false` for a duplicate delivery, so
-/// the caller runs the external effect at most once.
+/// The tenant-scoped inbox claim, as a statement, so the dedup namespace this
+/// insert binds is assertable without a live database.
+fn inbox_claim_statement(
+    tenant_id: Option<Uuid>,
+    message_id: Uuid,
+    idempotency_key: &str,
+    received_at: DateTime<Utc>,
+) -> Statement {
+    message_inbox::Entity::insert(message_inbox::ActiveModel {
+        message_id: Set(message_id),
+        tenant_id: Set(tenant_id),
+        idempotency_key: Set(idempotency_key.to_owned()),
+        received_at: Set(received_at),
+        ..Default::default()
+    })
+    .on_conflict(OnConflict::new().do_nothing().to_owned())
+    .build(DbBackend::Postgres)
+}
+
+/// Try to record an incoming message for consumer dedup, **in `tenant_id`'s
+/// dedup namespace**. Returns `true` the first time this message is seen there
+/// and `false` for a duplicate delivery, so the caller runs the external effect
+/// at most once.
+///
+/// `tenant_id` is required and has no default on purpose. The uniqueness this
+/// insert races against is `(tenant_id, idempotency_key)` — or, for `None`, the
+/// explicit *global* namespace enforced by
+/// `message_inbox_global_idempotency_uq`. Passing `None` for a tenant-owned
+/// message would collapse every tenant into that one namespace, so tenant B's
+/// different message sharing a business key with tenant A's (`invoice/2026-07`)
+/// would lose the `ON CONFLICT DO NOTHING`, return `false`, and have its effect
+/// **permanently skipped**. State the namespace the message actually belongs
+/// to; `None` means "genuinely global", never "unknown".
 ///
 // RECONCILE / HAZARD: this pool-based claim commits on its OWN connection, so it
 // is *not* atomic with the effect it guards. If the process crashes after this
@@ -353,35 +437,21 @@ pub async fn release_outbox_claims(
 // idempotent/fenced downstream and effect-loss-on-crash is acceptable.
 pub async fn inbox_try_insert(
     pool: &DatabaseConnection,
-    message_id: Uuid,
-    idempotency_key: &str,
-    received_at: DateTime<Utc>,
-) -> Result<bool, MessagingError> {
-    inbox_try_insert_scoped(pool, None, message_id, idempotency_key, received_at).await
-}
-
-/// Tenant-scoped form of [`inbox_try_insert`]. The same business key may be
-/// consumed independently in different tenants, while remaining unique inside
-/// each tenant (or inside the explicit global `None` namespace).
-pub async fn inbox_try_insert_scoped(
-    pool: &DatabaseConnection,
     tenant_id: Option<Uuid>,
     message_id: Uuid,
     idempotency_key: &str,
     received_at: DateTime<Utc>,
 ) -> Result<bool, MessagingError> {
-    let inserted = message_inbox::Entity::insert(message_inbox::ActiveModel {
-        message_id: Set(message_id),
-        tenant_id: Set(tenant_id),
-        idempotency_key: Set(idempotency_key.to_owned()),
-        received_at: Set(received_at),
-        ..Default::default()
-    })
-    .on_conflict(OnConflict::new().do_nothing().to_owned())
-    .exec_without_returning(pool)
-    .await
-    .map_err(MessagingError::database)?;
-    Ok(inserted == 1)
+    let result = pool
+        .execute(inbox_claim_statement(
+            tenant_id,
+            message_id,
+            idempotency_key,
+            received_at,
+        ))
+        .await
+        .map_err(MessagingError::database)?;
+    Ok(result.rows_affected() == 1)
 }
 
 /// Mark an inbox row processed once its effect completes.
@@ -552,6 +622,29 @@ impl<'a> OutboxPublisher<'a> {
         let rows =
             claim_pending_outbox(self.pool, claim_owner, self.claim_ttl, self.batch_size).await?;
 
+        // A transient database error mid-drain must not strand the rest of the
+        // claim: those rows are untouched but still carry `claim_owner` and a
+        // future `claim_expires_at`, so no worker could claim them for up to
+        // `claim_ttl` (minutes). Release first, then propagate.
+        match self.drain_claimed(rows, claim_owner).await {
+            Ok(published) => Ok(published),
+            Err(error) => {
+                if let Err(release_error) = release_outbox_claims(self.pool, claim_owner).await {
+                    tracing::error!(
+                        %release_error,
+                        "outbox: could not release claims after a batch error; rows stay leased until claim_ttl"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn drain_claimed(
+        &self,
+        rows: Vec<OutboxRecord>,
+        claim_owner: Uuid,
+    ) -> Result<u64, MessagingError> {
         let mut published: u64 = 0;
         for record in rows {
             let bytes = match serde_json::to_vec(&record.payload) {
@@ -576,6 +669,21 @@ impl<'a> OutboxPublisher<'a> {
                     .await?;
                 continue;
             }
+            // A slow broker can push a long batch past `claim_ttl`. Publishing
+            // a row whose lease already lapsed races a worker that reclaimed
+            // it, so stop before the broker call rather than after.
+            if !claim_still_held(self.pool, record.id, claim_owner).await? {
+                let lost = record_lost_lease();
+                tracing::warn!(
+                    id = %record.id,
+                    subject = %record.subject,
+                    claim_ttl_ms = self.claim_ttl.as_millis(),
+                    lost_lease_publishes = lost,
+                    "outbox: claim lease expired before publish; another worker owns this row now \
+                     — skipping it and shortening the batch"
+                );
+                break;
+            }
             match self
                 .publisher
                 .publish(&record.subject, &record.dedup_id, &bytes)
@@ -584,6 +692,21 @@ impl<'a> OutboxPublisher<'a> {
                 Ok(()) => {
                     if mark_published(self.pool, record.id, claim_owner, Utc::now()).await? {
                         published += 1;
+                    } else {
+                        // Owner-conditioned mark matched no row: the lease
+                        // lapsed between the check above and the publish, and
+                        // another worker reclaimed it. The row stays `pending`
+                        // and WILL be published again — deduplicated by the
+                        // broker only if the gap fits `duplicate_window`.
+                        let lost = record_lost_lease();
+                        tracing::warn!(
+                            id = %record.id,
+                            subject = %record.subject,
+                            dedup_id = %record.dedup_id,
+                            lost_lease_publishes = lost,
+                            "outbox: published a row whose claim lease had lapsed; it stays pending \
+                             and may be delivered twice if the gap exceeds the stream duplicate_window"
+                        );
                     }
                 }
                 Err(error) => {
@@ -725,7 +848,10 @@ mod tests {
         assert!(PURGE_PUBLISHED_OUTBOX_SQL.contains("status = 'published'"));
         assert!(PURGE_PUBLISHED_OUTBOX_SQL.contains("published_at IS NOT NULL"));
         assert!(!PURGE_PUBLISHED_OUTBOX_SQL.contains("failed"));
-        for sql in [PURGE_PROCESSED_INBOX_SQL, PURGE_PROCESSED_CONSUMER_INBOX_SQL] {
+        for sql in [
+            PURGE_PROCESSED_INBOX_SQL,
+            PURGE_PROCESSED_CONSUMER_INBOX_SQL,
+        ] {
             assert!(sql.contains("processed_at IS NOT NULL"));
         }
         for sql in [
@@ -738,6 +864,65 @@ mod tests {
         }
         assert!(RETENTION_SCHEMA_SQL.contains("message_outbox_published_retention_idx"));
         assert!(RETENTION_SCHEMA_SQL.contains("message_inbox_retention_idx"));
+    }
+
+    /// The inbox claim must bind the caller's dedup namespace, not silently
+    /// default to the global one: a `NULL` tenant_id is a *namespace*
+    /// (`message_inbox_global_idempotency_uq`), so a tenant-owned message
+    /// claimed there would collide with every other tenant's same business key
+    /// and have its effect permanently skipped.
+    #[test]
+    fn inbox_claim_binds_the_callers_tenant_dedup_namespace() {
+        let tenant = Uuid::from_u128(7);
+        let message = Uuid::from_u128(70);
+        let at = DateTime::<Utc>::from_timestamp(1_770_000_000, 0).unwrap();
+
+        let scoped = inbox_claim_statement(Some(tenant), message, "invoice/2026-07", at);
+        let scoped_sql = scoped.to_string();
+        assert!(scoped_sql.contains("tenant_id"), "{scoped_sql}");
+        assert!(
+            scoped_sql.contains(&tenant.to_string()),
+            "the claim must carry the caller's tenant: {scoped_sql}"
+        );
+        assert!(scoped_sql.contains("ON CONFLICT"), "{scoped_sql}");
+        assert!(scoped_sql.contains("DO NOTHING"), "{scoped_sql}");
+
+        // The explicit global namespace still exists, and is distinguishable.
+        let global = inbox_claim_statement(None, message, "invoice/2026-07", at).to_string();
+        assert!(global.contains("NULL"), "{global}");
+        assert_ne!(scoped_sql, global);
+
+        // Both namespaces the statement can target are backed by a uniqueness
+        // constraint, so neither is a free-for-all.
+        assert!(HARDENING_SCHEMA_SQL.contains("message_inbox_tenant_idempotency_uq"));
+        assert!(HARDENING_SCHEMA_SQL.contains("message_inbox_global_idempotency_uq"));
+    }
+
+    /// A row published after its lease lapsed can be published again by the
+    /// worker that reclaimed it. That must be observable, not silent.
+    #[test]
+    fn lost_lease_publishes_are_counted() {
+        let before = lost_lease_publishes();
+        assert_eq!(record_lost_lease(), before + 1);
+        assert_eq!(lost_lease_publishes(), before + 1);
+
+        // The pre-publish guard is owner- AND expiry-conditioned, so a batch
+        // that overran claim_ttl stops instead of racing the new owner.
+        assert!(CLAIM_STILL_HELD_SQL.contains("claim_owner = $2"));
+        assert!(CLAIM_STILL_HELD_SQL.contains("claim_expires_at > now()"));
+        assert!(CLAIM_STILL_HELD_SQL.trim_start().starts_with("SELECT"));
+    }
+
+    /// Saturating (not wrapping) attempt counts: `attempts as i32` above
+    /// `i32::MAX` produces a NEGATIVE count, which the backoff and
+    /// max-attempts arithmetic reads as "no attempts yet" — an infinite retry.
+    #[test]
+    fn staged_attempt_counts_saturate_instead_of_wrapping_negative() {
+        for attempts in [0u32, 1, 8, i32::MAX as u32, i32::MAX as u32 + 1, u32::MAX] {
+            let stored = i32::try_from(attempts).unwrap_or(i32::MAX);
+            assert!(stored >= 0, "{attempts} wrapped to {stored}");
+        }
+        assert_eq!(i32::try_from(u32::MAX).unwrap_or(i32::MAX), i32::MAX);
     }
 
     #[test]

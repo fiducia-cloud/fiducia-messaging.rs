@@ -24,14 +24,22 @@ const COMPAT_RESCHEDULE_SQL: &str =
 /// accepted any non-empty subject, so this stays deliberately looser than the
 /// canonical taxonomy (`subjects::Subject::parse`) — but a subject assembled
 /// from an untrusted string must not smuggle NATS wildcards (`*`, `>`),
-/// whitespace/control characters, or empty tokens (leading/trailing/double
-/// dots) into the publish path.
+/// whitespace/control characters, empty tokens (leading/trailing/double dots),
+/// or **identifiers** into the publish path.
+///
+/// The identifier rule is the taxonomy's cardinal invariant (see
+/// [`crate::subjects`]): ids live in the envelope, NEVER in the subject. The
+/// canonical path enforces it in `subjects::validate_token`; without the same
+/// per-token UUID rejection here, `fiducia.tenants.<uuid>.events` would pass
+/// the compat guard and explode the subject space through the back door.
 fn is_publishable_subject(subject: &str) -> bool {
     !subject.trim().is_empty()
         && !subject
             .chars()
             .any(|c| c.is_whitespace() || c.is_control() || c == '*' || c == '>')
-        && subject.split('.').all(|token| !token.is_empty())
+        && subject
+            .split('.')
+            .all(|token| !token.is_empty() && Uuid::parse_str(token).is_err())
 }
 
 fn validate_compat_publish(subject: &str, payload_len: usize) -> Result<(), OutboxError> {
@@ -226,6 +234,38 @@ mod tests {
         ] {
             assert!(!is_publishable_subject(bad), "accepted {bad:?}");
         }
+    }
+
+    /// The cardinal subject invariant — identifiers live in the envelope, never
+    /// in the subject — must hold on the compat path too, or the looser guard
+    /// becomes the back door the canonical `validate_token` closes.
+    #[test]
+    fn compat_subject_guard_rejects_identifier_tokens_like_the_canonical_path() {
+        let tenant = "11111111-1111-4111-8111-111111111111";
+        for smuggled in [
+            format!("fiducia.tenants.{tenant}.events"),
+            tenant.to_string(),
+            format!("legacy.{}.events", tenant.to_ascii_uppercase()),
+            format!("fiducia.executions.{tenant}"),
+        ] {
+            assert!(
+                !is_publishable_subject(&smuggled),
+                "identifier smuggled into subject {smuggled:?}"
+            );
+            assert!(matches!(
+                validate_compat_publish(&smuggled, 0),
+                Err(OutboxError::InvalidSubject)
+            ));
+            // The canonical path rejects the same token, for the same reason.
+            assert!(matches!(
+                crate::subjects::validate_token(tenant),
+                Err(crate::subjects::SubjectError::IdentifierInSubject(_))
+            ));
+        }
+
+        // Historic non-UUID subjects keep working.
+        assert!(is_publishable_subject("legacy-subject"));
+        assert!(is_publishable_subject("fiducia.tenants.acme-corp.events"));
     }
 
     #[test]

@@ -13,7 +13,11 @@
 //! Everything here is pure and deterministic — no clock, no id generation — so
 //! the caller threads in ids/timestamps and the tests assert exact values.
 
-use std::{collections::HashSet, fmt::Write, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt::Write,
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -176,11 +180,17 @@ impl OutboxRecord {
     /// Stage an envelope for publish. The raw business key is retained for the
     /// tenant-scoped database uniqueness constraint; the NATS dedup id is a
     /// fixed-size digest of `(tenant_id, idempotency_key)`.
+    ///
+    /// The envelope framing is validated first ([`MessageEnvelope::validate`]):
+    /// a blank `message_type` or an unknown `envelope_version` decodes nowhere,
+    /// so staging it would publish a message every consumer rejects while the
+    /// outbox reports it delivered.
     pub fn from_envelope<T: Serialize>(
         id: Uuid,
         subject: impl Into<String>,
         envelope: &MessageEnvelope<T>,
     ) -> Result<Self, MessagingError> {
+        envelope.validate()?;
         Ok(Self::pending_for_tenant(
             id,
             subject,
@@ -337,21 +347,59 @@ impl InboxRecord {
     }
 }
 
+/// How many accepted keys the in-memory [`Inbox`] retains before evicting the
+/// least-recently-used one. A process-lifetime guard must not grow with message
+/// volume; durable, unbounded dedup is `PgInbox` (`crate::inbox`), not this.
+pub const DEFAULT_INBOX_CAPACITY: usize = 100_000;
+
 /// In-memory at-most-once guard for *incoming* messages.
 ///
 /// Before running an external effect for a message, call [`accept`](Self::accept)
 /// with its idempotency key; a `false` means the key was already accepted (the
-/// sender retried) and the effect must be skipped. The Postgres equivalent is
-/// `db::inbox_try_insert`.
-#[derive(Debug, Default)]
+/// sender retried) and the effect must be skipped.
+///
+/// **Bounded, and therefore best-effort.** At most
+/// [`capacity`](Self::capacity) keys are retained (default
+/// [`DEFAULT_INBOX_CAPACITY`]); accepting beyond that evicts the
+/// least-recently-used key, so a redelivery older than the window is accepted
+/// again. It is also per-process and non-durable. **Durable dedup requires the
+/// Postgres inbox** — `crate::inbox::Inbox` (`PgInbox`), whose claim commits in
+/// the consumer's own transaction, or `db::inbox_try_insert`.
+#[derive(Debug)]
 pub struct Inbox {
-    seen: HashSet<String>,
+    /// dedup id -> the tick at which it was last used.
+    seen: HashMap<String, u64>,
+    /// tick -> dedup id, so the least-recently-used entry is `pop_first`.
+    order: BTreeMap<u64, String>,
+    next_tick: u64,
+    capacity: usize,
+}
+
+impl Default for Inbox {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_INBOX_CAPACITY)
+    }
 }
 
 impl Inbox {
-    /// A fresh, empty inbox.
+    /// A fresh, empty inbox holding [`DEFAULT_INBOX_CAPACITY`] keys.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A fresh, empty inbox with an explicit retention bound (minimum 1).
+    pub fn with_capacity(capacity: usize) -> Self {
+        Inbox {
+            seen: HashMap::new(),
+            order: BTreeMap::new(),
+            next_tick: 0,
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// How many keys are retained before the least-recently-used is evicted.
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Returns `true` the first time a global business key is seen, `false` for
@@ -363,20 +411,41 @@ impl Inbox {
     /// Tenant-scoped equivalent of [`accept`](Self::accept). The same business
     /// key may be accepted independently by different tenants.
     pub fn accept_for_tenant(&mut self, tenant_id: Option<Uuid>, key: &str) -> bool {
-        self.seen.insert(tenant_scoped_dedup_id(tenant_id, key))
+        let id = tenant_scoped_dedup_id(tenant_id, key);
+        let tick = self.next_tick;
+        self.next_tick += 1;
+        match self.seen.insert(id.clone(), tick) {
+            // Already accepted: refresh its recency and report the duplicate.
+            Some(previous) => {
+                self.order.remove(&previous);
+                self.order.insert(tick, id);
+                false
+            }
+            None => {
+                self.order.insert(tick, id);
+                while self.seen.len() > self.capacity {
+                    let Some((_, evicted)) = self.order.pop_first() else {
+                        break;
+                    };
+                    self.seen.remove(&evicted);
+                }
+                true
+            }
+        }
     }
 
     /// Whether a global business key has already been accepted.
     pub fn contains(&self, key: &str) -> bool {
-        self.seen.contains(&tenant_scoped_dedup_id(None, key))
+        self.seen.contains_key(&tenant_scoped_dedup_id(None, key))
     }
 
     /// Whether a tenant-scoped business key has already been accepted.
     pub fn contains_for_tenant(&self, tenant_id: Option<Uuid>, key: &str) -> bool {
-        self.seen.contains(&tenant_scoped_dedup_id(tenant_id, key))
+        self.seen
+            .contains_key(&tenant_scoped_dedup_id(tenant_id, key))
     }
 
-    /// Number of distinct keys accepted.
+    /// Number of distinct keys currently retained.
     pub fn len(&self) -> usize {
         self.seen.len()
     }
@@ -390,9 +459,12 @@ impl Inbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope::ENVELOPE_VERSION;
     use crate::publisher::RecordingPublisher;
+    use crate::subjects::EXECUTIONS_COMPLETED;
     use async_trait::async_trait;
     use chrono::TimeZone;
+    use std::collections::HashSet;
 
     fn at(secs: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 12, 0, 0, secs).unwrap()
@@ -648,6 +720,80 @@ mod tests {
         assert!(!inbox.accept_for_tenant(Some(tenant_a), "sync-42"));
         assert!(inbox.accept_for_tenant(Some(tenant_b), "sync-42"));
         assert!(inbox.contains_for_tenant(Some(tenant_a), "sync-42"));
+    }
+
+    /// An envelope that no consumer can decode must never be staged: it would
+    /// publish, mark `published`, and then be rejected by every `decode` — a
+    /// permanently undeliverable message reported as delivered.
+    #[test]
+    fn from_envelope_rejects_envelopes_no_consumer_can_decode() {
+        let good = MessageEnvelope::new_at(
+            at(0),
+            id(7),
+            "execution.completed",
+            serde_json::json!({ "ok": true }),
+            "idem-key-7",
+        );
+        assert!(OutboxRecord::from_envelope(id(100), EXECUTIONS_COMPLETED, &good).is_ok());
+
+        let mut blank_type = good.clone();
+        blank_type.message_type = "   ".to_string();
+        assert!(matches!(
+            OutboxRecord::from_envelope(id(101), EXECUTIONS_COMPLETED, &blank_type),
+            Err(MessagingError::MissingIdentity)
+        ));
+
+        let mut blank_source = good.clone();
+        blank_source.source = Some(String::new());
+        assert!(matches!(
+            OutboxRecord::from_envelope(id(102), EXECUTIONS_COMPLETED, &blank_source),
+            Err(MessagingError::MissingIdentity)
+        ));
+
+        let mut future_framing = good.clone();
+        future_framing.envelope_version = ENVELOPE_VERSION + 1;
+        assert!(matches!(
+            OutboxRecord::from_envelope(id(103), EXECUTIONS_COMPLETED, &future_framing),
+            Err(MessagingError::UnsupportedEnvelopeVersion(version))
+                if version == ENVELOPE_VERSION + 1
+        ));
+    }
+
+    /// The in-memory guard is a *bounded* best-effort cache, not a durable
+    /// dedup store: it must evict the least-recently-used key rather than grow
+    /// with message volume forever.
+    #[test]
+    fn in_memory_inbox_is_bounded_and_evicts_least_recently_used() {
+        assert_eq!(Inbox::new().capacity(), DEFAULT_INBOX_CAPACITY);
+
+        let mut inbox = Inbox::with_capacity(3);
+        for key in ["a", "b", "c"] {
+            assert!(inbox.accept(key));
+        }
+        assert_eq!(inbox.len(), 3);
+
+        // Touch "a" so "b" becomes the least-recently-used entry.
+        assert!(!inbox.accept("a"));
+        assert!(inbox.accept("d"), "a fourth key still dedups going forward");
+
+        assert_eq!(inbox.len(), 3, "capacity is never exceeded");
+        assert!(inbox.contains("a"), "recently used keys survive eviction");
+        assert!(inbox.contains("c"));
+        assert!(inbox.contains("d"));
+        assert!(!inbox.contains("b"), "the LRU key was evicted");
+
+        // Far past capacity: still bounded, and the newest keys are retained.
+        for n in 0..1_000 {
+            inbox.accept(&format!("bulk-{n}"));
+        }
+        assert_eq!(inbox.len(), 3);
+        assert!(inbox.contains("bulk-999"));
+
+        // A zero/absurd capacity request still keeps at least one key.
+        let mut minimum = Inbox::with_capacity(0);
+        assert_eq!(minimum.capacity(), 1);
+        assert!(minimum.accept("only"));
+        assert!(!minimum.accept("only"));
     }
 
     #[test]

@@ -137,18 +137,25 @@ There are **two publishers**, sharing one `message_outbox` table:
 
 **Consumers** get the mirror image, and there are likewise **two inboxes**:
 
-- `outbox::Inbox` — in-memory guard (part of the offline core):
+- `outbox::Inbox` — **bounded** in-memory guard (part of the offline core):
   `accept_for_tenant(tenant_id, key)` returns `false` for a duplicate within
-  that tenant. `accept(key)` is the explicit global-namespace shorthand.
-  `db::inbox_try_insert_scoped` is its Postgres equivalent; the legacy
-  `inbox_try_insert` wrapper uses the global namespace.
+  that tenant. `accept(key)` is the explicit global-namespace shorthand. It
+  retains at most `DEFAULT_INBOX_CAPACITY` keys (LRU eviction), so it is
+  best-effort and per-process — **durable dedup is `PgInbox`**.
+  `db::inbox_try_insert(pool, tenant_id, …)` is its Postgres equivalent; the
+  tenant namespace is a required argument, and `None` means *genuinely global*,
+  never "unknown" — passing it for tenant-owned work collapses every tenant into
+  one dedup namespace and permanently skips the losers' effects.
 - `PgInbox` (feature `postgres`, from the `inbox` module) — a Postgres
   **per-consumer** claim (`message_inbox_consumer`, `PRIMARY KEY (consumer,
   message_id)`). Inside the same transaction as its side effect a consumer calls
   `Inbox::begin(tx, consumer, &envelope)` → `InboxDecision::{Process, Duplicate}`
   and, on success, `mark_processed(...)`. Because the claim is per-consumer, the
   same message can be independently, idempotently processed by several
-  consumers, each obtaining effective exactly-once side effects.
+  consumers, each obtaining effective exactly-once side effects. `message_id` is
+  producer-supplied, so a conflicting claim held by a *different* tenant returns
+  `InboxError::TenantMismatch` instead of `Duplicate` — a foreign tenant can
+  never suppress your effect by replaying your message id.
 
 Either way: record the incoming message before running the effect; a duplicate
 delivery loses the insert and is skipped, so the external effect runs at most

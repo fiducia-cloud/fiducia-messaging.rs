@@ -47,7 +47,7 @@ sea-orm = { version = "1", default-features = false, features = [
 
 # Optional: a real NATS JetStream publisher (the `nats` feature). The default
 # build must NOT pull this in — the crate builds and tests with no network.
-async-nats = { version = "0.49.1", default-features = false, features = ["jetstream", "ring"], optional = true }
+async-nats = { version = "0.50.0", default-features = false, features = ["jetstream", "ring"], optional = true }
 
 # Optional: the JSON log subscriber for the deployable binaries (relay/compat).
 # Library consumers install their own subscriber; the default offline build

@@ -1,5 +1,5 @@
 //! SeaORM entity for `message_inbox` — the message-id-keyed inbox (a message
-//! is consumed at most once globally). Used by `db::inbox_try_insert*` /
+//! is consumed at most once per tenant namespace). Used by `db::inbox_try_insert` /
 //! `db::inbox_mark_processed`.
 
 use sea_orm::entity::prelude::*;
