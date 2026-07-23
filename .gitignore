@@ -15,3 +15,6 @@ tmp/
 target/
 *.pdb
 .cargo-target-*/
+
+# direnv-generated Nix dev-shell cache
+.direnv/
