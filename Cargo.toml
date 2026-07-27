@@ -36,7 +36,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 # Runtime-checked either way, so no DATABASE_URL is needed at build. Schema in
 # `migrations/` is applied declaratively (dpm) or via `db::apply_schema` — not
 # by a boot-time migrator.
-sea-orm = { version = "1", default-features = false, features = [
+sea-orm = { version = "2", default-features = false, features = [
     "macros",
     "runtime-tokio-rustls",
     "sqlx-postgres",
