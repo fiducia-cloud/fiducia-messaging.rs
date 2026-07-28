@@ -119,7 +119,7 @@ impl Inbox {
         let result = message_inbox_consumer::Entity::update_many()
             .col_expr(
                 message_inbox_consumer::Column::ProcessedAt,
-                Expr::current_timestamp().into(),
+                Expr::current_timestamp(),
             )
             .filter(message_inbox_consumer::Column::Consumer.eq(consumer))
             .filter(message_inbox_consumer::Column::MessageId.eq(message_id))
