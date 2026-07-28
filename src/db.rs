@@ -338,7 +338,7 @@ pub async fn reschedule_publish(
     error: &str,
 ) -> Result<bool, MessagingError> {
     let result = pool
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "UPDATE message_outbox
                 SET last_error = $3,
@@ -382,7 +382,7 @@ pub async fn release_outbox_claims(
     claim_owner: Uuid,
 ) -> Result<u64, MessagingError> {
     let result = pool
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
             RELEASE_CLAIMS_SQL,
             [claim_owner.into()],
@@ -443,7 +443,7 @@ pub async fn inbox_try_insert(
     received_at: DateTime<Utc>,
 ) -> Result<bool, MessagingError> {
     let result = pool
-        .execute(inbox_claim_statement(
+        .execute_raw(inbox_claim_statement(
             tenant_id,
             message_id,
             idempotency_key,
@@ -500,7 +500,7 @@ async fn purge(
 ) -> Result<u64, MessagingError> {
     let cutoff_ms = positive_ms(older_than, "retention age")?;
     let result = pool
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
             sql,
             [cutoff_ms.into()],

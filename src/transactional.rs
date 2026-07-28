@@ -78,7 +78,7 @@ impl Outbox {
         validate_compat_publish(subject, 0)?;
         let body = envelope.encode()?;
         validate_compat_publish(subject, body.len())?;
-        tx.execute(Statement::from_sql_and_values(
+        tx.execute_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
             COMPAT_ENQUEUE_SQL,
             [
@@ -141,7 +141,7 @@ impl OutboxPublisher {
                 // wildcard/injected subject or oversize payload to NATS; retain
                 // the row with durable error/backoff metadata for operator
                 // inspection, then continue with the rest of the batch.
-                tx.execute(Statement::from_sql_and_values(
+                tx.execute_raw(Statement::from_sql_and_values(
                     DbBackend::Postgres,
                     COMPAT_RESCHEDULE_SQL,
                     [message_id.into(), error.to_string().into()],
@@ -170,7 +170,7 @@ impl OutboxPublisher {
             };
             match publish {
                 Ok(()) => {
-                    tx.execute(Statement::from_sql_and_values(
+                    tx.execute_raw(Statement::from_sql_and_values(
                         DbBackend::Postgres,
                         COMPAT_MARK_PUBLISHED_SQL,
                         [message_id.into()],
@@ -179,7 +179,7 @@ impl OutboxPublisher {
                     published += 1;
                 }
                 Err(error) => {
-                    tx.execute(Statement::from_sql_and_values(
+                    tx.execute_raw(Statement::from_sql_and_values(
                         DbBackend::Postgres,
                         COMPAT_RESCHEDULE_SQL,
                         [message_id.into(), error.to_string().into()],
