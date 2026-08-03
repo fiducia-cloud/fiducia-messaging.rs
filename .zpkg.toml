@@ -1,0 +1,28 @@
+[package]
+org = "fiducia"
+name = "fiducia-messaging"
+version = "0.1.0"
+description = "Standard Fiducia NATS envelope, transactional outbox/inbox, and subject taxonomy library"
+license = "MIT"
+keywords = ["messaging", "nats", "outbox", "inbox", "rust"]
+language = "rust"
+
+[package.repository]
+vcs = "git"
+url = "https://github.com/fiducia-cloud/fiducia-messaging.rs"
+
+[publish]
+include_readme = true
+tag_format = "v{version}"
+smoke_test = "cargo test --manifest-path \"$ZED_PKG_TEST_TARGET/Cargo.toml\" --all-targets --locked"
+exclude = [".env", ".env.*", ".direnv/**", ".zed/**", ".zed-pack/**", "target/**", "tmp/**", "**/*.log", ".DS_Store"]
+
+[publish.native]
+registry = "crates-io"
+package = "fiducia-messaging"
+
+[install]
+adapter = "rust"
+
+[scripts]
+test = "cargo test --all-targets --locked"
