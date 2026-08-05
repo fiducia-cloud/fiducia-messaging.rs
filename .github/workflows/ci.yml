@@ -40,4 +40,28 @@ jobs:
       - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
         with:
           tool: cargo-audit@0.22.2
-      - run: cargo audit
+      - name: Prove advisory package is absent from the feature-unified build tree
+        run: |
+          set -euo pipefail
+          tree_file="${RUNNER_TEMP}/cargo-tree.txt"
+          cargo tree \
+            --locked \
+            --all-features \
+            --target all \
+            --edges normal,build,dev \
+            --prefix none \
+            --format '{p}' \
+            > "${tree_file}"
+          if grep -Fqx 'rkyv v0.7.46' "${tree_file}"; then
+            cargo tree \
+              --locked \
+              --all-features \
+              --target all \
+              --edges features \
+              --invert rkyv@0.7.46 || true
+            echo 'RUSTSEC-2026-0235 is reachable in the feature-unified build tree' >&2
+            exit 1
+          fi
+          echo 'rkyv 0.7.46 is lock metadata only; Cargo does not build it for any target'
+      - name: Audit the lock after the reachability proof
+        run: cargo audit --ignore RUSTSEC-2026-0235

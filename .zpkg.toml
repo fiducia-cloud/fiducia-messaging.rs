@@ -1,0 +1,28 @@
+[package]
+org = "fiducia-cloud"
+name = "fiducia-messaging"
+version = "0.1.0"
+description = "Standard Fiducia NATS envelope, transactional outbox/inbox, and subject taxonomy library"
+license = "MIT"
+keywords = ["messaging", "nats", "outbox", "inbox", "rust"]
+language = "rust"
+
+[package.repository]
+vcs = "git"
+url = "https://github.com/fiducia-cloud/fiducia-messaging.rs"
+
+[publish]
+include_readme = true
+tag_format = "v{version}"
+smoke_test = "cargo test --manifest-path \"$ZED_PKG_TEST_TARGET/Cargo.toml\" --all-targets --locked"
+exclude = [".env", ".env.*", ".direnv/**", ".zed/**", ".zed-pack/**", ".vendor/.zed/**", "target/**", "tmp/**", "**/*.log", ".DS_Store"]
+
+# Native crates.io publication is intentionally deferred. Cargo.toml contains
+# an optional Git-sourced telemetry dependency, which crates.io will not accept
+# until that dependency is replaced by a published, versioned crate.
+
+[install]
+adapter = "rust"
+
+[scripts]
+test = "cargo test --all-targets --locked"
