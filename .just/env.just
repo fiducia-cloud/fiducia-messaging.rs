@@ -218,8 +218,9 @@ env-keygen: _env-dec
     age-keygen -y "$key"
 
 # Fail-closed audit: no plaintext in git, gitignore intact, ciphertext valid.
+# This audit must be key-independent in CI; do not require ores-sops/bootstrap.
 [group('env')]
-env-check: _env-dec
+env-check:
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{ justfile_directory() }}
