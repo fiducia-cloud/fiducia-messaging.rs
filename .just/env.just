@@ -219,7 +219,7 @@ env-keygen: _env-dec
 
 # Fail-closed audit: no plaintext in git, gitignore intact, ciphertext valid.
 [group('env')]
-env-check: _env-dec
+env-check:
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{ justfile_directory() }}
@@ -269,9 +269,10 @@ env-check: _env-dec
         && echo "  ✓ $rule" || note "missing .gitignore rule: $rule"
     done
 
-    # Key-independent checks first, so this whole recipe is runnable in CI with
-    # no age key at all. Handing CI a decryption key just to lint would defeat
-    # the point of the audit.
+    # All preceding checks are key-independent. This audit has no _env-dec
+    # prerequisite: bootstrapping runtime plaintext directories would require
+    # ores-sops and make a keyless CI secrets audit fail before inspection.
+    # Do not require or supply a decryption key just to lint ciphertext.
     echo "ciphertext integrity:"
     shopt -s nullglob
     found=0
