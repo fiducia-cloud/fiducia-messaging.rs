@@ -218,8 +218,9 @@ env-keygen: _env-dec
     age-keygen -y "$key"
 
 # Fail-closed audit: no plaintext in git, gitignore intact, ciphertext valid.
+# Do not require decryption bootstrap for ciphertext-only CI audit.
 [group('env')]
-env-check: _env-dec
+env-check:
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{ justfile_directory() }}
