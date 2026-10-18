@@ -67,7 +67,7 @@ async fn insert_outbox_row<C: ConnectionTrait>(
     rec: &OutboxRecord,
 ) -> Result<(), MessagingError> {
     validate_outbox_record(rec)?;
-    message_outbox::Entity::insert(message_outbox::ActiveModel {
+    let inserted = message_outbox::Entity::insert(message_outbox::ActiveModel {
         id: Set(rec.id),
         subject: Set(rec.subject.clone()),
         tenant_id: Set(rec.tenant_id),
@@ -86,7 +86,51 @@ async fn insert_outbox_row<C: ConnectionTrait>(
     .exec_without_returning(conn)
     .await
     .map_err(MessagingError::database)?;
+    if inserted == 1 {
+        return Ok(());
+    }
+
+    // Uniqueness alone does NOT prove this is the same logical message.
+    let mut query = message_outbox::Entity::find()
+        .filter(message_outbox::Column::IdempotencyKey.eq(&rec.idempotency_key));
+    query = match rec.tenant_id {
+        Some(tenant) => query.filter(message_outbox::Column::TenantId.eq(tenant)),
+        None => query.filter(message_outbox::Column::TenantId.is_null()),
+    };
+    let existing = query.one(conn).await.map_err(MessagingError::database)?;
+    let Some(existing) = existing else {
+        return Err(MessagingError::database(
+            "outbox collision not explained by this tenant/idempotency key",
+        ));
+    };
+    if !replay_matches(
+        rec,
+        &existing.subject,
+        existing.tenant_id,
+        &existing.idempotency_key,
+        &existing.dedup_id,
+        &existing.payload,
+    ) {
+        return Err(MessagingError::database(
+            "outbox idempotency key reused with different message identity/content",
+        ));
+    }
     Ok(())
+}
+
+fn replay_matches(
+    rec: &OutboxRecord,
+    subject: &str,
+    tenant_id: Option<Uuid>,
+    idempotency_key: &str,
+    dedup_id: &str,
+    payload: &serde_json::Value,
+) -> bool {
+    rec.subject == subject
+        && rec.tenant_id == tenant_id
+        && rec.idempotency_key == idempotency_key
+        && rec.dedup_id == dedup_id
+        && rec.payload == *payload
 }
 
 /// Insert a staged outbox row using a pool connection. Convenience for callers
@@ -807,6 +851,67 @@ impl<'a> OutboxPublisher<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_identity_requires_identical_tenant_route_and_payload() {
+        let tenant = Some(Uuid::from_u128(11));
+        let rec = OutboxRecord::pending_for_tenant(
+            Uuid::from_u128(10),
+            "fiducia.executions.completed.v1",
+            tenant,
+            "effect-1",
+            serde_json::json!({"source":"one","count":1}),
+            Utc::now(),
+        );
+        assert!(replay_matches(
+            &rec,
+            &rec.subject,
+            tenant,
+            &rec.idempotency_key,
+            &rec.dedup_id,
+            &rec.payload
+        ));
+        assert!(!replay_matches(
+            &rec,
+            &rec.subject,
+            tenant,
+            &rec.idempotency_key,
+            &rec.dedup_id,
+            &serde_json::json!({"source":"one","count":2})
+        ));
+        assert!(!replay_matches(
+            &rec,
+            "fiducia.executions.failed.v1",
+            tenant,
+            &rec.idempotency_key,
+            &rec.dedup_id,
+            &rec.payload
+        ));
+        assert!(!replay_matches(
+            &rec,
+            &rec.subject,
+            None,
+            &rec.idempotency_key,
+            &rec.dedup_id,
+            &rec.payload
+        ));
+        assert!(!replay_matches(
+            &rec,
+            &rec.subject,
+            tenant,
+            "effect-2",
+            &rec.dedup_id,
+            &rec.payload
+        ));
+        assert!(!replay_matches(
+            &rec,
+            &rec.subject,
+            tenant,
+            &rec.idempotency_key,
+            "a different broker key",
+            &rec.payload
+        ));
+    }
 
     // DB-free sanity check: the embedded schema matches what the repo queries
     // expect. A live-Postgres integration test is out of scope for `cargo test`.
