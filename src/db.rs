@@ -864,28 +864,52 @@ mod tests {
             Utc::now(),
         );
         assert!(replay_matches(
-            &rec, &rec.subject, tenant, &rec.idempotency_key,
-            &rec.dedup_id, &rec.payload
+            &rec,
+            &rec.subject,
+            tenant,
+            &rec.idempotency_key,
+            &rec.dedup_id,
+            &rec.payload
         ));
         assert!(!replay_matches(
-            &rec, &rec.subject, tenant, &rec.idempotency_key,
-            &rec.dedup_id, &serde_json::json!({"source":"one","count":2})
+            &rec,
+            &rec.subject,
+            tenant,
+            &rec.idempotency_key,
+            &rec.dedup_id,
+            &serde_json::json!({"source":"one","count":2})
         ));
         assert!(!replay_matches(
-            &rec, "fiducia.executions.failed.v1", tenant,
-            &rec.idempotency_key, &rec.dedup_id, &rec.payload
+            &rec,
+            "fiducia.executions.failed.v1",
+            tenant,
+            &rec.idempotency_key,
+            &rec.dedup_id,
+            &rec.payload
         ));
         assert!(!replay_matches(
-            &rec, &rec.subject, None, &rec.idempotency_key,
-            &rec.dedup_id, &rec.payload
+            &rec,
+            &rec.subject,
+            None,
+            &rec.idempotency_key,
+            &rec.dedup_id,
+            &rec.payload
         ));
         assert!(!replay_matches(
-            &rec, &rec.subject, tenant, "effect-2",
-            &rec.dedup_id, &rec.payload
+            &rec,
+            &rec.subject,
+            tenant,
+            "effect-2",
+            &rec.dedup_id,
+            &rec.payload
         ));
         assert!(!replay_matches(
-            &rec, &rec.subject, tenant, &rec.idempotency_key,
-            "a different broker key", &rec.payload
+            &rec,
+            &rec.subject,
+            tenant,
+            &rec.idempotency_key,
+            "a different broker key",
+            &rec.payload
         ));
     }
 
