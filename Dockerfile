@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM rust:1.99.0-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS build
+FROM rust:1.100.0-slim-bookworm@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37 AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && apt-get clean
